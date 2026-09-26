@@ -9,6 +9,7 @@ const multer = require("multer");
 const { uploadMediaFilesToS3, deleteFileFromS3 } = require("../../../database/s3");
 const crypto = require("crypto");
 const { getPageForMerchant } = require("../../../lib/getPageForMerchant");
+const { UUID_RE } = require("../../../lib/uuidRe");
 
 // ---------------------------------------------------------------------------
 // Booking page settings
@@ -216,6 +217,96 @@ function parseServiceTypes(raw) {
 }
 
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+router.get('/bookings/:slug', authenticateFirebaseToken, async (req, res) => {
+  console.log("Booking Slug Route Hit");
+  const { slug } = req.params;
+  const userId = req.user?.id;
+
+  try {
+    const { rows } = await zingoPool.query(
+      `SELECT bp.id AS page_id, bp.name, b.*
+       FROM booking_pages bp
+       LEFT JOIN bookings b ON b.booking_page_id = bp.id
+       WHERE bp.slug = $1 AND bp.merchant_id = $2`,
+      [slug, userId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Booking page not found.' });
+    }
+
+    const name = rows[0].name;
+    const data = rows
+      .filter((r) => r.id !== null) // drop the null row from LEFT JOIN when there are no bookings yet
+      .map(({ page_id, name, ...booking }) => booking);
+
+    return res.json({ name, data });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to load bookings.' });
+  }
+});
+
+router.get('/booking/id/:id', async (req, res) => {
+  const { id } = req.params;
+
+  if (!UUID_RE.test(id)) {
+    return res.status(400).json({ error: 'Invalid booking id.' });
+  }
+
+  try {
+    const { rows } = await zingoPool.query(
+      `SELECT
+         b.*,
+         bp.name AS business_name,
+         bp.sections,
+         bp.service_types
+       FROM bookings b
+       JOIN booking_pages bp ON bp.id = b.booking_page_id
+       WHERE b.id = $1
+       LIMIT 1`,
+      [id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Booking not found.' });
+    }
+
+    const booking = rows[0];
+    const sections = Array.isArray(booking.sections) ? booking.sections : [];
+    const serviceTypes = Array.isArray(booking.service_types) ? booking.service_types : [];
+
+    const sectionMatch = sections.find((s) =>
+      typeof s === 'string' ? s === booking.section_id : s.id === booking.section_id
+    );
+    const serviceMatch = serviceTypes.find((s) =>
+      typeof s === 'string'
+        ? s.toLowerCase().replace(/\s+/g, '-') === booking.service_type_id || s === booking.service_type_id
+        : s.id === booking.service_type_id
+    );
+
+    return res.json({
+      booking: {
+        id: booking.id,
+        status: booking.status,
+        guests: booking.guests,
+        date: booking.booking_date,
+        time: booking.start_time,
+        fullName: booking.full_name,
+        contact: booking.phone,
+        note: booking.note,
+        businessName: booking.business_name,
+        sectionName: typeof sectionMatch === 'string' ? sectionMatch : sectionMatch?.name ?? null,
+        serviceTypeName: typeof serviceMatch === 'string' ? serviceMatch : serviceMatch?.name ?? null,
+        createdAt: booking.created_at,
+      },
+    });
+  } catch (err) {
+    console.error('Fetch booking by id error:', err);
+    return res.status(500).json({ error: 'Failed to load booking.' });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // GET /booking-settings  — list all of the current merchant's booking pages
@@ -700,19 +791,7 @@ router.get('/booking-settings/:id/blocked-slots', authenticateFirebaseToken, asy
 });
 
 router.post('/booking/create', async (req, res) => {
-  const {
-    pageId,
-    anonId,
-    sectionId,
-    serviceTypeId,
-    guests,
-    date,
-    time,
-    fullName,
-    contact,
-    note,
-  } = req.body;
-  console.log("req body", req.body)
+  const { pageId, anonId, sectionId, serviceTypeId, guests, date, time, fullName, contact, note } = req.body;
 
   if (!pageId || !guests || !date || !time || !fullName || !contact) {
     return res.status(400).json({ error: 'Missing required fields.' });
@@ -721,12 +800,7 @@ router.post('/booking/create', async (req, res) => {
   const client = await zingoPool.connect();
 
   try {
-    // 1. Fetch booking page details
-    const pageResult = await client.query(
-      `SELECT * FROM booking_pages WHERE id = $1 LIMIT 1`,
-      [pageId]
-    );
-
+    const pageResult = await client.query(`SELECT * FROM booking_pages WHERE id = $1 LIMIT 1`, [pageId]);
     const page = pageResult.rows[0];
 
     if (!page || !page.is_active) {
@@ -734,114 +808,74 @@ router.post('/booking/create', async (req, res) => {
       return res.status(400).json({ error: 'This page is not accepting bookings.' });
     }
 
-    // 2. Start transaction
+    // No chat connected = nobody would ever see the request.
+    if (!page.telegram_chat_id) {
+      client.release();
+      return res.status(409).json({ error: 'This venue has not connected Telegram yet.' });
+    }
+
     await client.query('BEGIN');
 
-    // Insert booking
-    const insertBookingQuery = `
-      INSERT INTO bookings (
-        booking_page_id,
-        section_id,
-        service_type_id,
-        guests,
-        booking_date,
-        start_time,
-        full_name,
-        phone,
-        note,
-        anon_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-      RETURNING *;
-    `;
-
-    const bookingValues = [
-      page.id,
-      sectionId || null,
-      serviceTypeId || null,
-      guests,
-      date,
-      time,
-      fullName.trim(),
-      contact.trim(),
-      note ? note.trim() : null,
-      anonId,
-    ];
-
-    const bookingResult = await client.query(insertBookingQuery, bookingValues);
+    const bookingResult = await client.query(
+      `INSERT INTO bookings (booking_page_id, section_id, service_type_id, guests, booking_date, start_time, full_name, phone, note, anon_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *;`,
+      [page.id, sectionId || null, serviceTypeId || null, guests, date, time, fullName.trim(), contact.trim(), note ? note.trim() : null, anonId]
+    );
     const booking = bookingResult.rows[0];
 
-    // Insert audit/history event
     await client.query(
-      `
-      INSERT INTO booking_events (booking_id, type, payload, actor)
-      VALUES ($1, $2, $3, $4);
-      `,
+      `INSERT INTO booking_events (booking_id, type, payload, actor) VALUES ($1,$2,$3,$4);`,
       [booking.id, 'created', JSON.stringify(booking), 'customer']
     );
 
-    // Commit booking insertion before triggering external API (Telegram)
-    await client.query('COMMIT');
-
-    // 3. Resolve section and service type display names
-    // Handles array of strings ['Indoor seating'] or array of objects [{ id: '...', name: '...' }]
     const sections = Array.isArray(page.sections) ? page.sections : [];
     const serviceTypes = Array.isArray(page.service_types) ? page.service_types : [];
-
     const sectionMatch = sections.find((s) => (typeof s === 'string' ? s === booking.section_id : s.id === booking.section_id));
     const sectionName = typeof sectionMatch === 'string' ? sectionMatch : sectionMatch?.name ?? '';
-
     const serviceMatch = serviceTypes.find((s) => (typeof s === 'string' ? s.toLowerCase().replace(/\s+/g, '-') === booking.service_type_id || s === booking.service_type_id : s.id === booking.service_type_id));
     const serviceName = typeof serviceMatch === 'string' ? serviceMatch : serviceMatch?.name ?? '';
 
     const text =
-      `📅 New booking request\n\n` +
-      `${booking.full_name} — ${booking.guests} guest(s)\n` +
+      `📅 New booking request\n\n${booking.full_name} — ${booking.guests} guest(s)\n` +
       `${booking.booking_date} at ${booking.start_time}` +
-      (sectionName ? `\n${sectionName}` : '') +
-      (serviceName ? ` · ${serviceName}` : '') +
-      `\nContact: ${booking.phone}` +
-      (booking.note ? `\nNote: ${booking.note}` : '');
+      (sectionName ? `\n${sectionName}` : '') + (serviceName ? ` · ${serviceName}` : '') +
+      `\nContact: ${booking.phone}` + (booking.note ? `\nNote: ${booking.note}` : '');
 
-    // 4. Send Telegram notification if chat ID exists
+    // Notify BEFORE committing — roll back if the venue never got it.
     let telegramMessageId = null;
-    if (page.telegram_chat_id) {
-      try {
-        const tgRes = await fetch(
-          `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: page.telegram_chat_id,
-              text,
-              reply_markup: {
-                inline_keyboard: [
-                  [
-                    { text: '✅ Accept', callback_data: `accept:${booking.id}` },
-                    { text: '❌ Decline', callback_data: `decline:${booking.id}` },
-                  ],
-                ],
-              },
-            }),
-          }
-        );
+    try {
+      const tgRes = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: page.telegram_chat_id,
+          text,
+          reply_markup: { inline_keyboard: [[
+            { text: '✅ Accept', callback_data: `accept:${booking.id}` },
+            { text: '❌ Decline', callback_data: `decline:${booking.id}` },
+          ]] },
+        }),
+      });
+      const tgData = await tgRes.json().catch(() => null);
 
-        const tgData = await tgRes.json();
-        telegramMessageId = tgData?.result?.message_id ? String(tgData.result.message_id) : null;
-      } catch (tgErr) {
-        console.error('Telegram notification error:', tgErr);
+      if (!tgRes.ok || !tgData?.ok) {
+        console.error('Telegram notification rejected:', tgData);
+        throw new Error('telegram_send_failed');
       }
+      telegramMessageId = tgData.result?.message_id ? String(tgData.result.message_id) : null;
+    } catch (tgErr) {
+      console.error('Telegram notification error:', tgErr);
+      await client.query('ROLLBACK');
+      client.release();
+      return res.status(502).json({ error: "Couldn't reach the venue right now. Please try again." });
     }
 
-    // 5. Update booking with Telegram message ID if available
     if (telegramMessageId) {
-      await client.query(
-        `UPDATE bookings SET telegram_message_id = $1 WHERE id = $2`,
-        [telegramMessageId, booking.id]
-      );
+      await client.query(`UPDATE bookings SET telegram_message_id = $1 WHERE id = $2`, [telegramMessageId, booking.id]);
       booking.telegram_message_id = telegramMessageId;
     }
 
+    await client.query('COMMIT');
     client.release();
     return res.status(201).json({ booking });
   } catch (err) {

@@ -12,10 +12,8 @@ const randomHex = crypto.randomBytes(8).toString("hex");
 const { getPageForMerchant } = require("../../../lib/getPageForMerchant");
 const { UUID_RE } = require("../../../lib/uuidRe");
 
-
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
-console.log("Checking Token:", process.env.TELEGRAM_BOT_TOKEN ? "EXISTS" : "UNDEFINED");
-console.log("Full Request URL:", `${TELEGRAM_API}/sendMessage`);
+
 // Helper to send messages
 async function sendTelegramMessage(chatId, text, replyMarkup = null) {
   try {
@@ -45,63 +43,13 @@ async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) 
 }
 
 
+
 // Helper to answer callback queries (removes button loading spinner)
 async function answerCallbackQuery(callbackQueryId, text = "") {
   return axios.post(`${TELEGRAM_API}/answerCallbackQuery`, {
     callback_query_id: callbackQueryId,
     text,
   });
-}
-
-// -----------------------------------------------------------------------
-// Upsert a telegram_contacts row once a customer connects a chat_id.
-//
-// telegram_contacts has NO unique constraint on chat_id itself — only on
-// phone_number and anon_id (both partial/nullable). So we have to pick one
-// of those as the conflict target. Bookings always collect a phone number,
-// so that's the primary key we upsert on; anon_id is a fallback for the
-// (currently unused here) case where a booking has no phone but does carry
-// an anon_id. If neither is available we skip linking rather than insert
-// an unkeyed, unmatchable row.
-// -----------------------------------------------------------------------
-async function linkTelegramContact({ chatId, phoneNumber, anonId = null, username = null }) {
-  const normalizedPhone = phoneNumber ? normalizePhoneNumber(phoneNumber) : null;
-
-  if (!normalizedPhone && !anonId) {
-    console.warn("linkTelegramContact: no phone or anon_id to key off of, skipping.", { chatId });
-    return;
-  }
-
-  try {
-    if (normalizedPhone) {
-      await zingoPool.query(
-        `INSERT INTO telegram_contacts (anon_id, phone_number, chat_id, telegram_username, updated_at)
-         VALUES ($1, $2, $3, $4, now())
-         ON CONFLICT (phone_number) WHERE phone_number IS NOT NULL
-         DO UPDATE SET
-           chat_id = EXCLUDED.chat_id,
-           telegram_username = EXCLUDED.telegram_username,
-           anon_id = COALESCE(telegram_contacts.anon_id, EXCLUDED.anon_id),
-           updated_at = now();`,
-        [anonId, normalizedPhone, chatId, username]
-      );
-    } else {
-      await zingoPool.query(
-        `INSERT INTO telegram_contacts (anon_id, phone_number, chat_id, telegram_username, updated_at)
-         VALUES ($1, $2, $3, $4, now())
-         ON CONFLICT (anon_id) WHERE anon_id IS NOT NULL
-         DO UPDATE SET
-           chat_id = EXCLUDED.chat_id,
-           telegram_username = EXCLUDED.telegram_username,
-           updated_at = now();`,
-        [anonId, normalizedPhone, chatId, username]
-      );
-    }
-  } catch (err) {
-    // A failed contact-link should never take down the booking confirmation
-    // flow — the bookings.telegram_chat_id update is the source of truth.
-    console.error("linkTelegramContact error:", err);
-  }
 }
 
 async function handleBookingStatusCallback(callbackQuery) {
@@ -156,7 +104,6 @@ async function handleBookingStatusCallback(callbackQuery) {
       newStatus === "confirmed" ? "Booking confirmed ✅" : "Booking declined ❌"
     );
 
-    // --- Update the merchant's message ---
     const originalText = callbackQuery.message?.text || "";
     const responderName = callbackQuery.from.username
       ? `@${callbackQuery.from.username}`
@@ -166,29 +113,14 @@ async function handleBookingStatusCallback(callbackQuery) {
         ? `✅ Confirmed by ${responderName}`
         : `❌ Declined by ${responderName}`;
 
-    // Phone number stays as a fallback whether or not the booker connected
-    // Telegram — auto-linkified on mobile for tap-to-call/text.
+    // Phone numbers in plain Telegram message text are auto-linkified on
+    // mobile — tapping one offers Call / Message / Copy, so no button
+    // (and no tel:/sms: URL scheme, which inline keyboards don't support) needed.
     const contactLine = booking.phone
       ? `\n📱 ${booking.full_name}: ${booking.phone}`
       : "";
 
     await editTelegramMessage(chatId, messageId, `${originalText}\n\n${statusLine}${contactLine}`);
-
-    // --- Notify the booker directly, only if they connected Telegram ---
-    if (booking.telegram_chat_id) {
-      const bookerText =
-        newStatus === "confirmed"
-          ? `✅ Your booking is confirmed!\n\n${booking.booking_date} at ${booking.start_time}`
-          : `❌ Sorry, your booking request couldn't be accommodated.\n\n${booking.booking_date} at ${booking.start_time}`;
-
-      try {
-        await sendTelegramMessage(booking.telegram_chat_id, bookerText);
-      } catch (notifyErr) {
-        // Don't fail the whole request over a failed booker notification —
-        // the merchant-side update already succeeded and is the source of truth.
-        console.error("Failed to notify booker:", notifyErr);
-      }
-    }
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("handleBookingStatusCallback error:", err);
@@ -278,34 +210,7 @@ router.post('/booking-settings/:id/telegram-link', authenticateFirebaseToken, as
   }
 });
 
-// GET /api/booking/:id/telegram-status
-// Public, unauthenticated: the customer-facing "Notify me on Telegram" widget
-// polls this to find out once the booking has a linked chat_id.
-router.get('/booking/:id/telegram-status', async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!UUID_RE.test(id)) return res.status(400).json({ error: 'Invalid booking id.' });
-
-    const result = await zingoPool.query(
-      `SELECT "telegram_chat_id" FROM bookings WHERE id = $1`,
-      [id]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Booking not found.' });
-    }
-
-    const chatId = result.rows[0].telegram_chat_id;
-    return res.status(200).json({
-      connected: Boolean(chatId),
-      chatId: chatId ? String(chatId) : null,
-    });
-  } catch (error) {
-    console.error('Error polling booking telegram status:', error);
-    return res.status(500).json({ error: 'Failed to check status.' });
-  }
-});
-
+// POST /api/telegram-webhook
 // POST /api/telegram-webhook
 router.post("/telegram-webhook", async (req, res) => {
   // Always return 200 OK immediately so Telegram doesn't retry delivery
@@ -313,6 +218,7 @@ router.post("/telegram-webhook", async (req, res) => {
 
   const { message, callback_query } = req.body || {};
   const dashboardUrl = "https://eatdoko.com";
+  const botUsername = process.env.TELEGRAM_BOT_USERNAME;
 
   const escapeHtml = (str) =>
     String(str || "")
@@ -321,120 +227,187 @@ router.post("/telegram-webhook", async (req, res) => {
       .replace(/>/g, "&gt;");
 
   // =========================================================================
-  // 1. User clicked a deep link and launched /start <token>
-  //    Token prefixes: sess_ (merchant, unsaved page) | bk_ (customer booking)
+  // 1. User clicked a deep link and launched /start <token> (or /start@Bot <token>
+  //    in a group, via a startgroup= link)
+  //    Token prefixes: sess_ (merchant, unsaved page) | bk_ (customer, anon_id)
   //    pg_ (merchant, existing saved page)
   // =========================================================================
-  if (message && message.text && message.text.startsWith("/start ")) {
-    const chatId = message.chat.id;
-    const senderName = message.from.first_name || "there";
-    const username = message.from.username ? `@${message.from.username}` : senderName;
-    const rawToken = message.text.split(" ")[1]?.trim();
+  if (message && message.text) {
+    // Matches "/start", "/start TOKEN", "/start@BotName", "/start@BotName TOKEN"
+    const startMatch = message.text.match(/^\/start(?:@\w+)?(?:\s+(\S+))?/);
 
-    if (!rawToken) return;
+    if (startMatch) {
+      const chatId = message.chat.id;
+      const chatType = message.chat.type; // "private" | "group" | "supergroup" | "channel"
+      const senderName = message.from?.first_name || "there";
+      const username = message.from?.username ? `@${message.from.username}` : senderName;
+      const rawToken = startMatch[1]?.trim();
 
-    try {
-      // --- Case A: Merchant, unsaved/session-based page creation ---
-      if (rawToken.startsWith("sess_")) {
-        const sessionRes = await zingoPool.query(
-          `SELECT "merchant_id" FROM "telegram_link_sessions"
-           WHERE "token" = $1 AND "expires_at" > now() LIMIT 1`,
-          [rawToken]
-        );
+      if (!rawToken) return;
 
-        if (sessionRes.rowCount === 0) {
+      const isGroupChat = chatType === "group" || chatType === "supergroup";
+
+      try {
+        // --- Case A: Merchant, unsaved/session-based page creation ---
+        if (rawToken.startsWith("sess_")) {
+          const sessionRes = await zingoPool.query(
+            `SELECT "merchant_id" FROM "telegram_link_sessions"
+             WHERE "token" = $1 AND "expires_at" > now() LIMIT 1`,
+            [rawToken]
+          );
+
+          if (sessionRes.rowCount === 0) {
+            await sendTelegramMessage(
+              chatId,
+              "⚠️ This connection session has expired or is invalid. Please click *Verify & Connect Telegram* again on your dashboard."
+            );
+            return;
+          }
+
+          // Group chats: arriving here means the merchant already picked a group
+          // via the "Connect to a Group" URL button — that action IS the confirmation,
+          // no callback button needed.
+          if (isGroupChat) {
+            const updateSession = await zingoPool.query(
+              `UPDATE "telegram_link_sessions"
+               SET "chat_id" = $1
+               WHERE "token" = $2 AND "expires_at" > now()
+               RETURNING "merchant_id"`,
+              [chatId, rawToken]
+            );
+
+            if (updateSession.rowCount > 0) {
+              await sendTelegramMessage(
+                chatId,
+                `✅ <b>Group connected!</b>\n\nBooking requests will be sent to this group from now on.`
+              );
+            } else {
+              await sendTelegramMessage(
+                chatId,
+                "⚠️ This session has expired. Please click *Verify & Connect Telegram* on your dashboard again."
+              );
+            }
+            return;
+          }
+
+          // Private chat: show confirm / switch-account / connect-to-group options
+          const groupDeepLink = `https://t.me/${botUsername}?startgroup=${rawToken}`;
+          const keyboard = {
+            inline_keyboard: [
+              [{ text: `✅ Connect as ${username}`, callback_data: `confirm_tg:${rawToken}` }],
+              [{ text: "👥 Connect to a Group instead", url: groupDeepLink }],
+              [{ text: "🔄 Switch Telegram Account", callback_data: "switch_account" }],
+            ],
+          };
+
+          const safeSender = escapeHtml(senderName);
           await sendTelegramMessage(
             chatId,
-            "⚠️ This connection session has expired or is invalid. Please click *Verify & Connect Telegram* again on your dashboard."
+            `Hello <b>${safeSender}</b>!\n\nDo you want to connect this Telegram account to receive instant booking notifications for:\n\n🏬 <b>your booking page</b>`,
+            keyboard
           );
           return;
         }
 
-        const keyboard = {
-          inline_keyboard: [
-            [{ text: `✅ Connect as ${username}`, callback_data: `confirm_tg:${rawToken}` }],
-            [{ text: "🔄 Switch Telegram Account", callback_data: "switch_account" }],
-          ],
-        };
+        // --- Case B: Merchant, existing saved page ---
+        if (rawToken.startsWith("pg_")) {
+          const pageToken = rawToken.replace("pg_", "");
+          const pageRes = await zingoPool.query(
+            `SELECT "name" FROM "booking_pages" WHERE "telegram_verify_token" = $1 LIMIT 1`,
+            [pageToken]
+          );
 
-        const safeSender = escapeHtml(senderName);
-        await sendTelegramMessage(
-          chatId,
-          `Hello <b>${safeSender}</b>!\n\nDo you want to connect this Telegram account to receive instant booking notifications for:\n\n🏬 <b>your booking page</b>`,
-          keyboard
-        );
-        return;
-      }
+          if (pageRes.rowCount === 0) {
+            await sendTelegramMessage(
+              chatId,
+              "⚠️ This connection link has already expired or been used. Please generate a new one from your dashboard."
+            );
+            return;
+          }
 
-      // --- Case B: Merchant, existing saved page ---
-      if (rawToken.startsWith("pg_")) {
-        const pageToken = rawToken.replace("pg_", "");
-        const pageRes = await zingoPool.query(
-          `SELECT "name" FROM "booking_pages" WHERE "telegram_verify_token" = $1 LIMIT 1`,
-          [pageToken]
-        );
+          const businessLabel = escapeHtml(pageRes.rows[0].name);
 
-        if (pageRes.rowCount === 0) {
+          // Group chats: same as above — picking the group via the URL button
+          // is the confirmation, save immediately.
+          if (isGroupChat) {
+            const updatePage = await zingoPool.query(
+              `UPDATE "booking_pages"
+               SET "telegram_chat_id" = $1, "telegram_verify_token" = NULL
+               WHERE "telegram_verify_token" = $2
+               RETURNING "name"`,
+              [chatId, pageToken]
+            );
+
+            if (updatePage.rowCount > 0) {
+              await sendTelegramMessage(
+                chatId,
+                `✅ <b>Group connected!</b>\n\nThis group will now receive new booking requests for <b>${businessLabel}</b>.`
+              );
+            } else {
+              await sendTelegramMessage(
+                chatId,
+                "⚠️ This link has already been used or expired. Please generate a new one from your dashboard."
+              );
+            }
+            return;
+          }
+
+          const groupDeepLink = `https://t.me/${botUsername}?startgroup=${rawToken}`;
+          const keyboard = {
+            inline_keyboard: [
+              [{ text: `✅ Connect as ${username}`, callback_data: `confirm_tg:${rawToken}` }],
+              [{ text: "👥 Connect to a Group instead", url: groupDeepLink }],
+              [{ text: "🔄 Switch Telegram Account", callback_data: "switch_account" }],
+            ],
+          };
+
+          const safeSender = escapeHtml(senderName);
           await sendTelegramMessage(
             chatId,
-            "⚠️ This connection link has already expired or been used. Please generate a new one from your dashboard."
+            `Hello <b>${safeSender}</b>!\n\nDo you want to connect this Telegram account to receive instant booking notifications for:\n\n🏬 <b>${businessLabel}</b>`,
+            keyboard
           );
           return;
         }
 
-        const businessLabel = escapeHtml(pageRes.rows[0].name);
-        const keyboard = {
-          inline_keyboard: [
-            [{ text: `✅ Connect as ${username}`, callback_data: `confirm_tg:${rawToken}` }],
-            [{ text: "🔄 Switch Telegram Account", callback_data: "switch_account" }],
-          ],
-        };
+        // --- Case C: Customer, connect this chat to their anon_id ---
+        if (rawToken.startsWith("bk_")) {
+          const bookingId = rawToken.replace("bk_", "").trim();
 
-        const safeSender = escapeHtml(senderName);
-        await sendTelegramMessage(
-          chatId,
-          `Hello <b>${safeSender}</b>!\n\nDo you want to connect this Telegram account to receive instant booking notifications for:\n\n🏬 <b>${businessLabel}</b>`,
-          keyboard
-        );
-        return;
-      }
+          if (!UUID_RE.test(bookingId)) {
+            await sendTelegramMessage(chatId, "⚠️ That link isn't valid. Please try again from the website.");
+            return;
+          }
 
-      // --- Case C: Customer, notify on a single booking ---
-      if (rawToken.startsWith("bk_")) {
-        const bookingId = rawToken.replace("bk_", "");
-        const bookingRes = await zingoPool.query(
-          `SELECT b.id, b.full_name, bp.name AS business_name
-           FROM bookings b
-           JOIN booking_pages bp ON bp.id = b.booking_page_id
-           WHERE b.id = $1 LIMIT 1`,
-          [bookingId]
-        );
+          const result = await zingoPool.query(
+            `UPDATE bookings b
+            SET telegram_chat_id = $1
+            FROM booking_pages bp
+            WHERE b.id = $2 AND bp.id = b.booking_page_id
+            RETURNING b.id, bp.name AS business_name`,
+            [chatId, bookingId]
+          );
 
-        if (bookingRes.rowCount === 0) {
-          await sendTelegramMessage(chatId, "⚠️ We couldn't find that booking. It may have been removed.");
+          if (result.rowCount === 0) {
+            await sendTelegramMessage(chatId, "⚠️ We couldn't find that booking. Please try again from the website.");
+            return;
+          }
+
+          const businessName = escapeHtml(result.rows[0].business_name);
+          await sendTelegramMessage(
+            chatId,
+            `✅ You're set — we'll message you here as soon as your booking at <b>${businessName}</b> is confirmed.\nOr track your booking at: ${process.env.NEXT_PUBLIC_FRONTEND}/my-bookings/${bookingId}`
+          );
           return;
         }
 
-        const booking = bookingRes.rows[0];
-        const businessName = escapeHtml(booking.business_name);
-        const keyboard = {
-          inline_keyboard: [[{ text: "✅ Notify me here", callback_data: `confirm_bk:${booking.id}` }]],
-        };
-
-        await sendTelegramMessage(
-          chatId,
-          `Hi! Connect this chat to get updates on your booking at <b>${businessName}</b>?`,
-          keyboard
-        );
-        return;
+        // Unknown token shape
+        await sendTelegramMessage(chatId, "⚠️ That link isn't valid. Please try again from the website.");
+      } catch (err) {
+        console.error("Error processing /start command:", err);
       }
-
-      // Unknown token shape
-      await sendTelegramMessage(chatId, "⚠️ That link isn't valid. Please try again from the website.");
-    } catch (err) {
-      console.error("Error processing /start command:", err);
+      return;
     }
-    return;
   }
 
   // =========================================================================
@@ -524,41 +497,29 @@ router.post("/telegram-webhook", async (req, res) => {
       return;
     }
 
-    // --- Action: Customer confirms booking notification chat ---
+    // --- Action: Customer confirms notification chat (anon_id -> telegram_contacts) ---
     if (data.startsWith("confirm_bk:")) {
       const bookingId = data.replace("confirm_bk:", "").trim();
 
-      if (!UUID_RE.test(bookingId)) {
-        await answerCallbackQuery(callbackId, "Invalid booking.");
-        return;
-      }
-
       try {
         const result = await zingoPool.query(
-          `UPDATE bookings SET telegram_chat_id = $1 WHERE id = $2 RETURNING id, phone`,
+          `UPDATE bookings
+          SET telegram_chat_id = $1
+          WHERE id = $2
+          RETURNING id`,
           [chatId, bookingId]
         );
 
         if (result.rowCount > 0) {
-          const booking = result.rows[0];
-
-          // Link/refresh this chat_id against the shared telegram_contacts
-          // table, keyed on the booking's phone number.
-          await linkTelegramContact({
-            chatId,
-            phoneNumber: booking.phone,
-            username: callback_query.from.username || null,
-          });
-
           await answerCallbackQuery(callbackId, "Connected!");
           await editTelegramMessage(
             chatId,
             messageId,
-            `You're all set — we'll message you here as soon as your booking is confirmed.`
+            `You're all set — we'll message you here as soon as your booking is confirmed. Your booking ID: ${bookingId}`
           );
         } else {
           await answerCallbackQuery(callbackId, "Booking not found.");
-          await editTelegramMessage(chatId, messageId, "⚠️ We couldn't find that booking anymore.");
+          await editTelegramMessage(chatId, messageId, "⚠️ We couldn't find that booking.");
         }
       } catch (err) {
         console.error("Error confirming booking chat link:", err);
