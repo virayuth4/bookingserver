@@ -16,12 +16,7 @@ const initializeDatabases = require('./database/pgInit')
 
 
 
-const userRoutes = require('./api/user/userRoutes')
-//For Merchant Related Routes
-const merchantPointRoutes = require('./api/merchant/pointsRoutes')
-const merchantRoutes = require('./api/merchant/merchantRoutes')
-const shopifyRoutes = require('./api/shopify/shopifyRoutes');
-const { startSpinBot, stopSpinBot } = require("./httpSpinBot");
+
 
 // CORS configuration
 const corsOptions = {
@@ -78,33 +73,15 @@ app.get('/health', (req, res) => {
 });
 
 
-app.use('/api', userRoutes)
-app.use('/api/merchant', merchantPointRoutes)
-app.use('/api/merchant', merchantRoutes)
-app.use('/api/shopify', shopifyRoutes);
-app.use ('/api/merchant', require('./api/merchant/couponRoutes'))
-app.use('/api/merchant', require('./api/merchant/rewardRoutes'))
-app.use('/api/merchant', require('./api/merchant/affiliateRoutes'))
-app.use('/api/merchant', require('./api/merchant/affiliateOfferRoutes'))
-app.use('/api/merchant', require('./api/admin/cashBackRoutes'))
-app.use('/api/merchant', require('./api/merchant/promoRoutes'))
-app.use('/api/merchant', require('./api/merchant/hotelRoutes'))
-app.use('/api/merchant', require('./api/merchant/flightRoutes'))
-app.use('/api/merchant', require('./api/merchant/withdrawalRoutes'))
-app.use('/api/merchant', require('./api/merchant/chatCouponRoutes'))
-app.use('/api/merchant', require('./api/merchant/telegramCouponRoute'))
-app.use('/api/merchant', require('./api/admin/merchantLinkRoutes'))
-app.use('/api/merchant', require('./api/merchant/webhookRoutes'))
-
-// For EatDoko
-app.use('/api/eatdoko', require('./api/eatdoko/spinRoutes'))
-app.use('/api/eatdoko', require('./api/eatdoko/addRoutes.js'))
-app.use('/api/eatdoko', require('./api/eatdoko/seoRoutes.js'))
-app.use('/api/eatdoko', require('./api/eatdoko/eatdokoSessions.js'))
-app.use('/api/eatdoko', require('./api/eatdoko/eventsRoutes.js'))
 
 
-const startBotHistoryCleanup = require("./helper/cleanUpBotHistory.js");
+
+
+// For Booking Link
+app.use('/api/booking-link', require('./booking/api/user/userRoutes.js'))
+app.use('/api/booking-link', require('./booking/api/booking/bookingRoutes.js'))
+app.use('/api/booking-link', require('./booking/api/booking/slugRoutes.js'))
+app.use('/api/booking-link', require('./booking/api/telegram/telegramRoutes.js'))
 
 
 async function startServer() {
@@ -150,29 +127,14 @@ async function startServer() {
 
   initializeDatabases().catch(console.error);
 
-  // Register scheduled tasks
-  if (!isDev) {
-    cron.schedule("0 21 * * *", stopSpinBot, { timezone: TZ }); // 9 PM: stop
-    cron.schedule("0 9 * * *", startSpinBot, { timezone: TZ });  // 9 AM: start
-
-    // Midnight Cleanup Task (Runs at 00:00 Phnom Penh time)
-    startBotHistoryCleanup();
-  } else {
-    console.log("Development mode: spinBot and cleanup cron jobs disabled");
-  }
+  
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server is running on port: ${PORT}`);
     console.log(`Environment: ${process.env.NODE_ENV}`);
     console.log("Client:", process.env.NEXT_PUBLIC_BACKEND);
 
-    if (isDev) {
-      console.log("Development mode: spinBot will not start");
-    } else if (isActiveHours(TZ)) {
-      startSpinBot();
-    } else {
-      console.log("Outside active hours, spinBot will start at 9 AM");
-    }
+  
   });
 }
 startServer()

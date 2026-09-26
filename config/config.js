@@ -24,7 +24,7 @@ const loadEnvironmentVariables = () => {
         : undefined;
 
     // Enhanced CORS configuration with more flexible origins
-    const defaultOrigins = [
+const defaultOrigins = [
         'https://goldfish-app-gu3zc.ondigitalocean.app',
         'https://lobster-app-4scgy.ondigitalocean.app',
         'https://zingoclient-cndio.ondigitalocean.app',
@@ -33,18 +33,16 @@ const loadEnvironmentVariables = () => {
         'http://localhost:9000',
         'http://127.0.0.1:3000',
         'http://127.0.0.1:9000',
-        "http://162.159.140.98",
-
         'http://192.168.18.6:3000',
-        "products-sale-bucket.s3.ap-southeast-1.amazonaws.com",
-        "https://king-prawn-app-rrla3.ondigitalocean.app",
-        "https://rielpoint.vercel.app",
-        "https://rielpoint-git-main-virayuth-lims-projects.vercel.app",
-        "https://rielpoint.com",
-        "https://www.rielpoint.com",
-        "https://www.eatdoko.com",
-        "https://eatdoko.com"
-        
+        'https://king-prawn-app-rrla3.ondigitalocean.app',
+        'https://rielpoint.vercel.app',
+        'https://rielpoint-git-main-virayuth-lims-projects.vercel.app',
+        'https://rielpoint.com',
+        'https://www.rielpoint.com',
+        'https://www.eatdoko.com',
+        'https://eatdoko.com',
+        'https://afterglow-monsieur-quarterly.ngrok-free.dev',
+        'https://afterglow-monsieur-quarterly.ngrok-free.app',
     ];
 
     const corsOrigins = process.env.CORS_ORIGINS

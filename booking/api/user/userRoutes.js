@@ -1,15 +1,87 @@
 const express = require("express");
-const zingoPool = require("../../database/pgZingo");
-const { admin, auth } = require('../../auth/firebase-admin');
 const axios = require("axios");
 const router = express.Router();
-const authenticateFirebaseToken = require('../../auth/authFirebaseToken');
-const { normalizePhoneNumber, toFirebaseEmail } = require("../../lib/normalizePhoneNumber");
-const jwt = require('jsonwebtoken');
-const RESET_TOKEN_SECRET = process.env.OTP_ENCRYPTION_KEY;
+const authenticateFirebaseToken = require("../../../auth/authFirebaseToken");
+const zingoPool = require("../../../database/pgZingo");
+const { admin, auth } = require("../../../auth/firebase-admin");
+const { normalizePhoneNumber, toFirebaseEmail } = require("../../../lib/normalizePhoneNumber");
 
 
 
+const TELEGRAM_GATEWAY_URL = 'https://gatewayapi.telegram.org/sendVerificationMessage';
+
+// Gateway requires E.164 (+855...). Adjust if normalizePhoneNumber already returns "+855...".
+function toE164(phoneNumber) {
+    let digits = String(phoneNumber || '').replace(/\D/g, '');
+    if (digits.startsWith('0')) digits = '855' + digits.slice(1); // local Cambodian format -> country code
+    return `+${digits}`;
+}
+
+async function sendOTPWithTelegramGateway(phoneNumber, otp, fullName, requestNumber = 1, ttlSeconds = 60) {
+    console.log(`[Telegram Gateway] Sending OTP to ${phoneNumber} | Attempt: ${requestNumber}`);
+
+    const token = process.env.TELEGRAM_GATEWAY_TOKEN; // server-only secret
+    if (!token) {
+        console.error('❌ TELEGRAM_GATEWAY_TOKEN is undefined!');
+        return { success: false, error: 'Configuration Error: Missing Telegram Gateway token' };
+    }
+
+    // Gateway only accepts numeric codes of 4-8 digits
+    if (!/^\d{4,8}$/.test(String(otp))) {
+        return { success: false, error: 'Invalid OTP format: must be 4-8 digits' };
+    }
+
+    // ttl must be within 30-3600s; if undelivered in that window, Telegram refunds the fee
+    const ttl = Math.min(3600, Math.max(30, Math.floor(ttlSeconds)));
+
+    try {
+        const response = await axios.post(
+            TELEGRAM_GATEWAY_URL,
+            {
+                phone_number: toE164(phoneNumber),
+                code: String(otp),
+                ttl,
+                payload: `otp:${requestNumber}`, // internal use only, not shown to the user
+            },
+            {
+                timeout: 8000,
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                },
+            }
+        );
+
+        const body = response.data;
+
+        if (body?.ok) {
+            console.log('✅ [Telegram Gateway] Sent. request_id:', body.result?.request_id);
+            return {
+                success: true,
+                message: 'OTP sent via Telegram',
+                data: {
+                    requestId: body.result?.request_id,
+                    cost: body.result?.request_cost,
+                    remainingBalance: body.result?.remaining_balance,
+                },
+            };
+        }
+
+        console.warn('⚠️ [Telegram Gateway] ok=false:', body);
+        return { success: false, error: 'Telegram Gateway rejected the request', details: body?.error };
+    } catch (error) {
+        // Gateway returns { ok: false, error: "SOME_CODE" } on failures
+        const details = error.response?.data?.error || error.response?.data || error.message;
+
+        if (error.code === 'ECONNABORTED') {
+            console.error('❌ [Telegram Gateway] Request timed out');
+        } else {
+            console.error('❌ [Telegram Gateway] Failed:', details);
+        }
+
+        return { success: false, error: 'Failed to send OTP via Telegram', details };
+    }
+}
 
 async function sendOTPWithServiceAPI(phoneNumber, otp, fullName, requestNumber = 1) {
     console.log("\n--- [START] Sending OTP via External Service ---");
@@ -88,14 +160,14 @@ router.post("/user/anonId",  async (req, res) => {
     }
  
     await zingoPool.query(
-      `INSERT INTO anon_accounts (anon_id, user_id)
+      `INSERT INTO booking_anon_accounts (anon_id, user_id)
        VALUES ($1::uuid, $2)
        ON CONFLICT (anon_id) DO UPDATE SET user_id = EXCLUDED.user_id`,
       [anonId, userId]
     );
  
     const backfill = await zingoPool.query(
-      `UPDATE affiliate_clicks SET user_id = $2
+      `UPDATE booking_affiliate_clicks SET user_id = $2
        WHERE anon_id = $1::uuid AND user_id IS NULL
        RETURNING click_id`,
       [anonId, userId]
@@ -109,7 +181,7 @@ router.post("/user/anonId",  async (req, res) => {
 });
 
 router.get('/user/profile', authenticateFirebaseToken, async (req, res) => {
-    console.log('riel point user route hit')
+    console.log('booking user route hit')
     // console.log('Firebase UID from user-profile route', req.user.uid)
     // console.log("User Id", req.user.id)
     // console.log("userId", req.user)
@@ -118,7 +190,7 @@ router.get('/user/profile', authenticateFirebaseToken, async (req, res) => {
     try {
 
 
-     const query = `SELECT * FROM rielpoint_users WHERE id = $1`;
+     const query = `SELECT * FROM booking_users WHERE id = $1`;
     const result = await zingoPool.query(query, [req.user.id]);
 
         if (result.rows.length === 0) {
@@ -157,19 +229,19 @@ router.get('/user/profile', authenticateFirebaseToken, async (req, res) => {
 });
 
 router.get('/merchant/profile', authenticateFirebaseToken, async (req, res) => {
-    console.log('riel point user + merchant route hit')
+    console.log('booking user + merchant route hit')
 
     try {
         const query = `
             SELECT
-                ru.*,
+                bu.*,
                 CASE
-                    WHEN am.owner_id IS NOT NULL THEN row_to_json(am)
+                    WHEN bam.owner_id IS NOT NULL THEN row_to_json(bam)
                     ELSE NULL
                 END AS affiliate_merchant
-            FROM rielpoint_users ru
-            LEFT JOIN affiliate_merchants am ON am.owner_id = ru.id
-            WHERE ru.id = $1
+            FROM booking_users bu
+            LEFT JOIN booking_affiliate_merchants bam ON bam.owner_id = bu.id
+            WHERE bu.id = $1
         `;
         const result = await zingoPool.query(query, [req.user.id]);
 
@@ -245,7 +317,7 @@ router.post("/user/registration/initiate", async (req, res) => {
         console.log("Generated OTP:", otp);
 
         const query = `
-            INSERT INTO rielpoint_otp (
+            INSERT INTO booking_otp (
                 "phone_number", "otp_code", "user_info"
             )
             VALUES ($1, $2, $3)
@@ -269,7 +341,9 @@ router.post("/user/registration/initiate", async (req, res) => {
         const result = await client.query(query, values);
         console.log("Query Result:", result.rows[0]);
 
-        const otpResult = await sendOTPWithServiceAPI(phoneNumber, otp, fullName);
+        // const otpResult = await sendOTPWithServiceAPI(phoneNumber, otp, fullName);
+        const otpResult = await sendOTPWithTelegramGateway(phoneNumber, otp, fullName, 1, 60);
+
 
             if (!otpResult.success) {
                 console.error("OTP Delivery failed, notifying client...");
@@ -304,7 +378,7 @@ router.post("/user/registration/otp/confirmation/:phoneNumber", async (req, res)
         const getOtpQuery = `
         SELECT "otp_code", attempts, "created_at", "expires_at",
             EXTRACT(EPOCH FROM ("expires_at" - NOW())) as seconds_remaining
-        FROM rielpoint_otp
+        FROM booking_otp
         WHERE "phone_number" = $1
         `;
 
@@ -322,13 +396,13 @@ router.post("/user/registration/otp/confirmation/:phoneNumber", async (req, res)
             // Use the actual expires_at column set on insert, instead of a separate hardcoded window
             if (secondsRemaining <= 0) {
                 console.log("OTP expired, deleting record");
-                await zingoPool.query('DELETE FROM rielpoint_otp WHERE "phone_number" = $1', [phoneNumber]);
+                await zingoPool.query('DELETE FROM booking_otp WHERE "phone_number" = $1', [phoneNumber]);
                 return res.status(400).json({ success: false, message: "OTP has expired. Please request a new one." });
             }
 
             const newAttempts = attempts + 1;
             await zingoPool.query(`
-                UPDATE rielpoint_otp
+                UPDATE booking_otp
                 SET attempts = $1
                 WHERE "phone_number" = $2
             `, [newAttempts, phoneNumber]);
@@ -337,13 +411,13 @@ router.post("/user/registration/otp/confirmation/:phoneNumber", async (req, res)
 
             if (newAttempts > 3) {
                 console.log("Max attempts exceeded, deleting OTP");
-                await zingoPool.query('DELETE FROM rielpoint_otp WHERE "phone_number" = $1', [phoneNumber]);
+                await zingoPool.query('DELETE FROM booking_otp WHERE "phone_number" = $1', [phoneNumber]);
                 return res.status(401).json({ success: false, message: "Too many attempts. Please request a new OTP." });
             }
 
             if (otp === storedOtp) {
                 console.log("OTP confirmed successfully.");
-                await zingoPool.query('DELETE FROM rielpoint_otp WHERE "phone_number" = $1', [phoneNumber]);
+                await zingoPool.query('DELETE FROM booking_otp WHERE "phone_number" = $1', [phoneNumber]);
                 // await sendSignUpNotificationToTelegram(phoneNumber, otp);
                 return res.status(200).json({ success: true, message: "OTP confirmed successfully." });
             } else {
@@ -402,11 +476,11 @@ router.post('/create-user-profile', async (req, res) => {
       // failing — but never let a second, different user steal an anonId
       // that's already linked to someone else.
       await zingoPool.query(
-        `INSERT INTO rielpoint_anon_users (anon_id, user_id, linked_at)
+        `INSERT INTO booking_anon_users (anon_id, user_id, linked_at)
          VALUES ($1, $2, NOW())
          ON CONFLICT (anon_id) DO UPDATE
            SET user_id = EXCLUDED.user_id, linked_at = NOW()
-           WHERE rielpoint_anon_users.user_id = EXCLUDED.user_id`,
+           WHERE booking_anon_users.user_id = EXCLUDED.user_id`,
         [anonId, userId]
       );
     } catch (linkErr) {
@@ -417,7 +491,7 @@ router.post('/create-user-profile', async (req, res) => {
   };
 
   try {
-    const checkUserQuery = 'SELECT * FROM rielpoint_users WHERE email = $1';
+    const checkUserQuery = 'SELECT * FROM booking_users WHERE email = $1';
     const checkUserResult = await zingoPool.query(checkUserQuery, [email]);
 
     if (checkUserResult.rows.length > 0) {
@@ -433,7 +507,7 @@ router.post('/create-user-profile', async (req, res) => {
     let validReferrerId = null;
     if (referredBy) {
       const referrerCheck = await zingoPool.query(
-        'SELECT id FROM rielpoint_users WHERE id = $1',
+        'SELECT id FROM booking_users WHERE id = $1',
         [referredBy]
       );
       if (referrerCheck.rows.length > 0) {
@@ -442,7 +516,7 @@ router.post('/create-user-profile', async (req, res) => {
     }
 
     const insertUserQuery = `
-      INSERT INTO rielpoint_users (email, role, fullname, phone_number, rielpoints, username, referred_by)
+      INSERT INTO booking_users (email, role, fullname, phone_number, reward_points, username, referred_by)
       VALUES ($1, $2, $3, $4, $5, $6, $7)
       RETURNING *`;
     const insertUserValues = [
@@ -472,7 +546,7 @@ router.post("/user/forgot-password/initiate", async (req, res) => {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
     const query = `
-        INSERT INTO rielpoint_otp ("phone_number", "otp_code")
+        INSERT INTO booking_otp ("phone_number", "otp_code")
         VALUES ($1, $2)
         ON CONFLICT ("phone_number")
         DO UPDATE SET
@@ -508,7 +582,7 @@ router.post("/user/forgot-password/otp-confirmation", async (req, res) => {
         const getOtpQuery = `
             SELECT "otp_code", attempts,
                 EXTRACT(EPOCH FROM ("expires_at" - NOW())) as seconds_remaining
-            FROM rielpoint_otp
+            FROM booking_otp
             WHERE "phone_number" = $1
         `;
         const otpResult = await zingoPool.query(getOtpQuery, [formattedPhoneNumber]);
@@ -521,18 +595,18 @@ router.post("/user/forgot-password/otp-confirmation", async (req, res) => {
         const attempts = record.attempts || 0;
 
         if (record.seconds_remaining <= 0) {
-            await zingoPool.query('DELETE FROM rielpoint_otp WHERE "phone_number" = $1', [formattedPhoneNumber]);
+            await zingoPool.query('DELETE FROM booking_otp WHERE "phone_number" = $1', [formattedPhoneNumber]);
             return res.status(400).json({ success: false, message: "OTP has expired. Please request a new one." });
         }
 
         const newAttempts = attempts + 1;
         await zingoPool.query(
-            `UPDATE rielpoint_otp SET attempts = $1 WHERE "phone_number" = $2`,
+            `UPDATE booking_otp SET attempts = $1 WHERE "phone_number" = $2`,
             [newAttempts, formattedPhoneNumber]
         );
 
         if (newAttempts > 3) {
-            await zingoPool.query('DELETE FROM rielpoint_otp WHERE "phone_number" = $1', [formattedPhoneNumber]);
+            await zingoPool.query('DELETE FROM booking_otp WHERE "phone_number" = $1', [formattedPhoneNumber]);
             return res.status(401).json({ success: false, message: "Too many attempts. Please request a new OTP." });
         }
 
@@ -545,8 +619,8 @@ router.post("/user/forgot-password/otp-confirmation", async (req, res) => {
 
         // Verified — burn the OTP, then reset the password right away.
         // newPassword only ever existed in this one request; it's never
-        // written to rielpoint_otp at all.
-        await zingoPool.query('DELETE FROM rielpoint_otp WHERE "phone_number" = $1', [formattedPhoneNumber]);
+        // written to booking_otp at all.
+        await zingoPool.query('DELETE FROM booking_otp WHERE "phone_number" = $1', [formattedPhoneNumber]);
 
         await resetFirebasePassword(formattedPhoneNumber, newPassword);
 
@@ -571,13 +645,13 @@ router.post("/user/registration/otp/resend/:phoneNumber", async (req, res) => {
     const client = await zingoPool.connect();
     try {
         // Debug: see exactly what phone_number values currently exist in the table
-        const debugAllQuery = `SELECT "phone_number", "resend_count", "created_at", "expires_at" FROM rielpoint_otp`;
+        const debugAllQuery = `SELECT "phone_number", "resend_count", "created_at", "expires_at" FROM booking_otp`;
         const debugAllResult = await client.query(debugAllQuery);
-        console.log("[DEBUG] all rows currently in rielpoint_otp:", debugAllResult.rows);
+        console.log("[DEBUG] all rows currently in booking_otp:", debugAllResult.rows);
 
         const findQuery = `
             SELECT "user_info", "resend_count"
-            FROM rielpoint_otp
+            FROM booking_otp
             WHERE "phone_number" = $1
         `;
         console.log("[DEBUG] running findQuery with param:", [phoneNumber]);
@@ -617,7 +691,7 @@ router.post("/user/registration/otp/resend/:phoneNumber", async (req, res) => {
         console.log("[DEBUG] new OTP generated:", otp);
 
         const updateQuery = `
-            UPDATE rielpoint_otp
+            UPDATE booking_otp
             SET "otp_code" = $1,
                 "attempts" = 0,
                 "resend_count" = $2,

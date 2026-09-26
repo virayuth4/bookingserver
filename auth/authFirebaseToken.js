@@ -25,12 +25,12 @@ const authenticateFirebaseToken = async (req, res, next) => {
     
     if (userEmail) {
       // Email authentication
-      query = 'SELECT id FROM rielpoint_users WHERE email = $1';
+      query = 'SELECT id FROM booking_users WHERE email = $1';
       params = [userEmail];
     } else if (userPhone || userIdentifier) {
       // Phone authentication - use either the phone from token or the custom header
       const phoneNumber = userPhone ? userPhone.replace('+', '') : userIdentifier;
-      query = 'SELECT id FROM rielpoint_users WHERE email = $1';
+      query = 'SELECT id FROM booking_users WHERE email = $1';
       params = [phoneNumber];
     } else {
       return res.status(400).json({ error: 'No valid identifier found' });
