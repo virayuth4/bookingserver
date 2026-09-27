@@ -15,7 +15,14 @@ require('dotenv').config();
 const initializeDatabases = require('./database/pgInit')
 
 
-
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection:", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err);
+  // consider: gracefully drain and restart via your process manager
+  // rather than letting it die silently mid-request
+});
 
 
 // CORS configuration
@@ -83,6 +90,9 @@ app.use('/api/booking-link', require('./booking/api/booking/bookingRoutes.js'))
 app.use('/api/booking-link', require('./booking/api/booking/slugRoutes.js'))
 app.use('/api/booking-link', require('./booking/api/telegram/telegramRoutes.js'))
 
+
+// For view tracking
+app.use('/api/booking-link', require('./api/tracker/trackViewRoutes.js'))
 
 async function startServer() {
   const TZ = "Asia/Phnom_Penh";

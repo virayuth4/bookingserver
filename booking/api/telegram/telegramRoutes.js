@@ -11,8 +11,18 @@ const crypto = require("crypto");
 const randomHex = crypto.randomBytes(8).toString("hex");
 const { getPageForMerchant } = require("../../../lib/getPageForMerchant");
 const { UUID_RE } = require("../../../lib/uuidRe");
+const { escapeHtml, formatBookingDate, formatBookingTime } = require("../../../lib/formats");
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+
+function replaceBookingHeader(originalText, newStatus) {
+  const headerEn = newStatus === "confirmed" ? "✅ Booking confirmed" : "❌ Booking declined";
+  const headerKm = newStatus === "confirmed" ? "✅ បានបញ្ជាក់កក់ទីតាំង" : "❌ បដិសេធការកក់ទីតាំង";
+ 
+  return originalText
+    .replace(/^📅 New booking request/m, headerEn)
+    .replace(/^📅 សំណើកក់ទីតាំងថ្មី/m, headerKm);
+}
 
 // Helper to send messages
 async function sendTelegramMessage(chatId, text, replyMarkup = null) {
@@ -34,7 +44,7 @@ async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) 
       chat_id: chatId,
       message_id: messageId,
       text,
-      parse_mode: "Markdown",
+      parse_mode: "HTML",
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
   } catch (err) {
@@ -42,14 +52,16 @@ async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) 
   }
 }
 
-
-
 // Helper to answer callback queries (removes button loading spinner)
 async function answerCallbackQuery(callbackQueryId, text = "") {
-  return axios.post(`${TELEGRAM_API}/answerCallbackQuery`, {
-    callback_query_id: callbackQueryId,
-    text,
-  });
+  try {
+    return await axios.post(`${TELEGRAM_API}/answerCallbackQuery`, {
+      callback_query_id: callbackQueryId,
+      text,
+    });
+  } catch (err) {
+    console.error("Telegram answerCallbackQuery error:", err.response?.data || err.message);
+  }
 }
 
 async function handleBookingStatusCallback(callbackQuery) {
@@ -58,6 +70,9 @@ async function handleBookingStatusCallback(callbackQuery) {
   const messageId = callbackQuery.message.message_id;
   const data = callbackQuery.data;
   const respondedBy = callbackQuery.from.id;
+  const responderName = callbackQuery.from.username
+    ? `@${callbackQuery.from.username}`
+    : callbackQuery.from.first_name;
 
   const [action, bookingId] = data.split(":");
 
@@ -72,23 +87,51 @@ async function handleBookingStatusCallback(callbackQuery) {
   try {
     await client.query("BEGIN");
 
-    const updateResult = await client.query(
-      `UPDATE bookings
-       SET status = $1,
-           responded_at = now(),
-           responded_by_id = $2
-       WHERE id = $3 AND status = 'pending'
-       RETURNING *;`,
-      [newStatus, respondedBy, bookingId]
-    );
+   const updateResult = await client.query(
+    `UPDATE bookings b
+    SET status = $1,
+        responded_at = now(),
+        responded_by_id = $2,
+        responded_by_name = $3
+    FROM booking_pages bp
+    WHERE b.id = $4 AND b.status = 'pending' AND bp.id = b.booking_page_id
+    RETURNING b.*, bp.name AS business_name, bp.telegram AS merchant_telegram, bp.phone AS merchant_phone;`,
+    [newStatus, respondedBy, responderName, bookingId]
+  );
 
     const booking = updateResult.rows[0];
 
     if (!booking) {
       await client.query("ROLLBACK");
+
+      // Look up what it actually is now, and sync the message to reality
+     const current = await client.query(
+        `SELECT b.*, bp.name AS business_name, bp.telegram AS merchant_telegram, bp.phone AS merchant_phone
+        FROM bookings b
+        JOIN booking_pages bp ON bp.id = b.booking_page_id
+        WHERE b.id = $1`,
+        [bookingId]
+      );
+      const b = current.rows[0];
+
       await answerCallbackQuery(callbackId, "Already handled.");
-      client.release();
-      return;
+
+      if (b) {
+        const originalText = callbackQuery.message?.text || "";
+        const statusLine =
+          b.status === "confirmed" ? `✅ Confirmed by ${b.responded_by_name || "someone"}` :
+          b.status === "declined"  ? `❌ Declined by ${b.responded_by_name || "someone"}` :
+          `Status: ${b.status}`;
+
+        const contactLine = b.phone
+          ? `\nNotify your customer at: ${b.full_name}: ${b.phone}`
+          : "";
+
+        // Edit with no replyMarkup arg → Telegram drops the inline keyboard
+        const headerSwapped = replaceBookingHeader(originalText, b.status);
+        await editTelegramMessage(chatId, messageId, `${headerSwapped}\n\n${statusLine}${contactLine}`);
+      }
+      return; // finally{} still releases the client — no manual release() here
     }
 
     await client.query(
@@ -105,9 +148,6 @@ async function handleBookingStatusCallback(callbackQuery) {
     );
 
     const originalText = callbackQuery.message?.text || "";
-    const responderName = callbackQuery.from.username
-      ? `@${callbackQuery.from.username}`
-      : callbackQuery.from.first_name;
     const statusLine =
       newStatus === "confirmed"
         ? `✅ Confirmed by ${responderName}`
@@ -117,10 +157,39 @@ async function handleBookingStatusCallback(callbackQuery) {
     // mobile — tapping one offers Call / Message / Copy, so no button
     // (and no tel:/sms: URL scheme, which inline keyboards don't support) needed.
     const contactLine = booking.phone
-      ? `\n📱 ${booking.full_name}: ${booking.phone}`
+      ? `\nNotify your customer at: ${booking.full_name}: ${booking.phone}`
       : "";
 
-    await editTelegramMessage(chatId, messageId, `${originalText}\n\n${statusLine}${contactLine}`);
+     await editTelegramMessage(chatId, messageId, `${replaceBookingHeader(originalText, newStatus)}\n\n${statusLine}${contactLine}`);
+
+    // Notify the booker (customer) on their own chat, if they've connected Telegram
+if (booking.telegram_chat_id) {
+  const businessName = escapeHtml(booking.business_name || "the business");
+
+  const dateLine = booking.booking_date
+        ? `\n📅 Date: ${escapeHtml(formatBookingDate(booking.booking_date))}`
+        : "";
+      const timeLine = booking.start_time
+        ? `\n⏰ Time: ${escapeHtml(formatBookingTime(booking.start_time))}`
+        : "";
+  const partyLine = booking.party_size ? `\n👥 Party size: ${escapeHtml(String(booking.party_size))}` : "";
+  const notesLine = booking.note ? `\n📝 Notes: ${escapeHtml(booking.note)}` : "";
+  const detailsBlock = `${dateLine}${timeLine}${partyLine}${notesLine}`;
+
+  // merchant_telegram_chat_id is a raw numeric chat id, not a shareable
+  // t.me/ link — it only lets *your bot* message that chat server-side.
+  // Swap in a real @username or phone number from booking_pages if you
+  // have one, for something the booker can actually tap/use.
+ const merchantContact = `${booking.merchant_telegram} or ${booking.merchant_phone}` || "the business";
+  const trackingLine = `\n\n[View your booking here](${process.env.NEXT_PUBLIC_FRONTEND}/my-bookings/${booking.id})`;
+  
+  const bookerText =
+    newStatus === "confirmed"
+      ? `✅ <b>Your booking at ${businessName} is confirmed!</b>${detailsBlock}\n\nIf you need to make any changes, please contact the merchant directly at: ${merchantContact}.${trackingLine}`
+      : `❌ <b>Your booking at ${businessName} was declined.</b>${detailsBlock}\n\nPlease try a different time, or contact the merchant directly if you have questions.${trackingLine}`;
+
+  await sendTelegramMessage(booking.telegram_chat_id, bookerText);
+}
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("handleBookingStatusCallback error:", err);
@@ -129,6 +198,33 @@ async function handleBookingStatusCallback(callbackQuery) {
     client.release();
   }
 }
+
+// GET /api/booking-link/booking-notify-status/:bookingId
+
+router.get('/booking-notify-status/:bookingId', async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    if (!UUID_RE.test(bookingId)) {
+      return res.status(400).json({ error: 'Invalid booking id.' });
+    }
+
+    const result = await zingoPool.query(
+      `SELECT "telegram_chat_id" FROM "bookings" WHERE "id" = $1`,
+      [bookingId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Booking not found.' });
+    }
+
+    const chatId = result.rows[0].telegram_chat_id;
+    return res.status(200).json({ connected: Boolean(chatId) });
+  } catch (error) {
+    console.error('Error checking booking telegram status:', error);
+    return res.status(500).json({ error: 'Failed to check status.' });
+  }
+});
+
 // Create a temporary session
 router.post('/booking-settings/telegram-session', authenticateFirebaseToken, async (req, res) => {
   try {
@@ -211,7 +307,6 @@ router.post('/booking-settings/:id/telegram-link', authenticateFirebaseToken, as
 });
 
 // POST /api/telegram-webhook
-// POST /api/telegram-webhook
 router.post("/telegram-webhook", async (req, res) => {
   // Always return 200 OK immediately so Telegram doesn't retry delivery
   res.sendStatus(200);
@@ -219,12 +314,6 @@ router.post("/telegram-webhook", async (req, res) => {
   const { message, callback_query } = req.body || {};
   const dashboardUrl = "https://eatdoko.com";
   const botUsername = process.env.TELEGRAM_BOT_USERNAME;
-
-  const escapeHtml = (str) =>
-    String(str || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
 
   // =========================================================================
   // 1. User clicked a deep link and launched /start <token> (or /start@Bot <token>
@@ -396,7 +485,7 @@ router.post("/telegram-webhook", async (req, res) => {
           const businessName = escapeHtml(result.rows[0].business_name);
           await sendTelegramMessage(
             chatId,
-            `✅ You're set — we'll message you here as soon as your booking at <b>${businessName}</b> is confirmed.\nOr track your booking at: ${process.env.NEXT_PUBLIC_FRONTEND}/my-bookings/${bookingId}`
+          `✅ You're set — we'll message you here as soon as your booking at <b>${businessName}</b> is confirmed.\nOr <a href="${process.env.NEXT_PUBLIC_FRONTEND}/my-bookings/${bookingId}">view your booking here</a>`
           );
           return;
         }

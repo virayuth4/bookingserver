@@ -10,6 +10,7 @@ const { uploadMediaFilesToS3, deleteFileFromS3 } = require("../../../database/s3
 const crypto = require("crypto");
 const { getPageForMerchant } = require("../../../lib/getPageForMerchant");
 const { UUID_RE } = require("../../../lib/uuidRe");
+const { formatRequestedAt, formatBookingDate, formatBookingTime } = require("../../../lib/formats");
 
 // ---------------------------------------------------------------------------
 // Booking page settings
@@ -217,6 +218,35 @@ function parseServiceTypes(raw) {
 }
 
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+router.get('/bookings/anon/:anonId', async (req, res) => {
+  try {
+    const { anonId } = req.params; // <-- Use req.params, not req.query
+    console.log("anonId", anonId)
+
+    const result = await zingoPool.query(
+      `SELECT 
+         bookings.*,
+         booking_pages.name AS page_name,
+         booking_pages.phone AS page_phone,
+         booking_pages.telegram AS page_telegram,
+         booking_pages.telegram_chat_id AS page_telegram_chat_id
+       FROM bookings
+       LEFT JOIN booking_pages ON bookings.booking_page_id = booking_pages.id
+       WHERE bookings.anon_id = $1`,
+      [anonId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Booking not found.' });
+    }
+
+    return res.json({ booking: result.rows });
+  } catch (err) {
+    console.error('Error fetching booking:', err);
+    return res.status(500).json({ error: 'Internal server error.' });
+  }
+});
 
 router.get('/bookings/:slug', authenticateFirebaseToken, async (req, res) => {
   console.log("Booking Slug Route Hit");
@@ -836,10 +866,24 @@ router.post('/booking/create', async (req, res) => {
     const serviceName = typeof serviceMatch === 'string' ? serviceMatch : serviceMatch?.name ?? '';
 
     const text =
-      `📅 New booking request\n\n${booking.full_name} — ${booking.guests} guest(s)\n` +
-      `${booking.booking_date} at ${booking.start_time}` +
-      (sectionName ? `\n${sectionName}` : '') + (serviceName ? ` · ${serviceName}` : '') +
-      `\nContact: ${booking.phone}` + (booking.note ? `\nNote: ${booking.note}` : '');
+      `📅 New booking request\n` +
+      `Requested on: ${formatRequestedAt()}\n` +
+      `――――――――――――――――\n\n` +
+      `Name: ${booking.full_name} — ${booking.guests} guest(s)\n` +
+      `Date & Time: ${formatBookingDate(booking.booking_date)} at ${formatBookingTime(booking.start_time)}\n` +
+      (sectionName || serviceName ? `Service: ${[sectionName, serviceName].filter(Boolean).join(' · ')}\n` : '') +
+      `Contact: ${booking.phone}` +
+      (booking.note ? `\nNote: ${booking.note}` : '');
+
+    const khmerText =
+      `📅 សំណើកក់ទីតាំងថ្មី\n` +
+      `ស្នើសុំនៅ: ${formatRequestedAt()}\n` +
+      `――――――――――――――――\n\n` +
+      `ឈ្មោះ: ${booking.full_name} — ${booking.guests} ភ្ញៀវ\n` +
+      `ថ្ងៃខែ & ពេលវេលា: ${formatBookingDate(booking.booking_date)} នៅម៉ោង ${formatBookingTime(booking.start_time)}\n` +
+      (sectionName || serviceName ? `សេវាកម្ម: ${[sectionName, serviceName].filter(Boolean).join(' · ')}\n` : '') +
+      `ទំនាក់ទំនង: ${booking.phone}` +
+      (booking.note ? `\nកំណត់ចំណាំ: ${booking.note}` : '');
 
     // Notify BEFORE committing — roll back if the venue never got it.
     let telegramMessageId = null;
