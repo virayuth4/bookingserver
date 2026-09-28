@@ -14,6 +14,8 @@ const { UUID_RE } = require("../../../lib/uuidRe");
 const { escapeHtml, formatBookingDate, formatBookingTime } = require("../../../lib/formats");
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+const CUSTOMER_TELEGRAM_API = `https://api.telegram.org/bot${process.env.ACME_RESERVE_CUSTOMER_BOT_TOKEN}`;
+
 
 function replaceBookingHeader(originalText, newStatus) {
   const headerEn = newStatus === "confirmed" ? "✅ Booking confirmed" : "❌ Booking declined";
@@ -25,9 +27,9 @@ function replaceBookingHeader(originalText, newStatus) {
 }
 
 // Helper to send messages
-async function sendTelegramMessage(chatId, text, replyMarkup = null) {
+async function sendTelegramMessage(chatId, text, replyMarkup = null, api = TELEGRAM_API) {
   try {
-    return await axios.post(`${TELEGRAM_API}/sendMessage`, {
+    return await axios.post(`${api}/sendMessage`, {
       chat_id: chatId,
       text,
       parse_mode: "HTML",
@@ -37,7 +39,6 @@ async function sendTelegramMessage(chatId, text, replyMarkup = null) {
     console.error("Telegram sendMessage error:", err.response?.data || err.message);
   }
 }
-
 async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) {
   try {
     return await axios.post(`${TELEGRAM_API}/editMessageText`, {
@@ -172,7 +173,7 @@ if (booking.telegram_chat_id) {
       const timeLine = booking.start_time
         ? `\n⏰ Time: ${escapeHtml(formatBookingTime(booking.start_time))}`
         : "";
-  const partyLine = booking.party_size ? `\n👥 Party size: ${escapeHtml(String(booking.party_size))}` : "";
+  const partyLine = booking.guests ? `\n👥 Party size: ${escapeHtml(String(booking.guests))}` : "";
   const notesLine = booking.note ? `\n📝 Notes: ${escapeHtml(booking.note)}` : "";
   const detailsBlock = `${dateLine}${timeLine}${partyLine}${notesLine}`;
 
@@ -180,15 +181,17 @@ if (booking.telegram_chat_id) {
   // t.me/ link — it only lets *your bot* message that chat server-side.
   // Swap in a real @username or phone number from booking_pages if you
   // have one, for something the booker can actually tap/use.
- const merchantContact = `${booking.merchant_telegram} or ${booking.merchant_phone}` || "the business";
-  const trackingLine = `\n\n[View your booking here](${process.env.NEXT_PUBLIC_FRONTEND}/my-bookings/${booking.id})`;
+    const merchantContact =
+     [booking.merchant_telegram, booking.merchant_phone].filter(Boolean).join(" or ") || "the business";
+     const trackingLine = `\n\n<a href="${process.env.NEXT_PUBLIC_FRONTEND}/my-bookings/${booking.id}">View your booking here</a>`;
   
   const bookerText =
     newStatus === "confirmed"
       ? `✅ <b>Your booking at ${businessName} is confirmed!</b>${detailsBlock}\n\nIf you need to make any changes, please contact the merchant directly at: ${merchantContact}.${trackingLine}`
       : `❌ <b>Your booking at ${businessName} was declined.</b>${detailsBlock}\n\nPlease try a different time, or contact the merchant directly if you have questions.${trackingLine}`;
 
-  await sendTelegramMessage(booking.telegram_chat_id, bookerText);
+    const sent = await sendTelegramMessage(booking.telegram_chat_id, bookerText, null, CUSTOMER_TELEGRAM_API);
+
 }
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
