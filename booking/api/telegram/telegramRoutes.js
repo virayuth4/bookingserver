@@ -53,6 +53,19 @@ async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) 
   }
 }
 
+// Helper function to swap buttons
+async function editTelegramReplyMarkup(chatId, messageId, replyMarkup) {
+  try {
+    return await axios.post(`${TELEGRAM_API}/editMessageReplyMarkup`, {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: replyMarkup,
+    });
+  } catch (err) {
+    console.error("Telegram editMessageReplyMarkup error:", err.response?.data || err.message);
+  }
+}
+
 // Helper to answer callback queries (removes button loading spinner)
 async function answerCallbackQuery(callbackQueryId, text = "") {
   try {
@@ -75,9 +88,11 @@ async function handleBookingStatusCallback(callbackQuery) {
     ? `@${callbackQuery.from.username}`
     : callbackQuery.from.first_name;
 
-  const [action, bookingId] = data.split(":");
 
-  if (!["accept", "decline"].includes(action) || !UUID_RE.test(bookingId)) {
+  const [rawAction, bookingId] = data.split(":");
+  const action = rawAction.replace(/^yes_/, ""); // "yes_accept" -> "accept"
+
+ if (!["accept", "decline"].includes(action) || !UUID_RE.test(bookingId)) {
     await answerCallbackQuery(callbackId, "Invalid action.");
     return;
   }
@@ -512,10 +527,57 @@ router.post("/telegram-webhook", async (req, res) => {
     const messageId = callback_query.message.message_id;
 
     // --- Action: Booking accept/decline (merchant side) ---
-    if (data.startsWith("accept:") || data.startsWith("decline:")) {
-      await handleBookingStatusCallback(callback_query);
+      if (data.startsWith("accept:") || data.startsWith("decline:")) {
+      const [action, bookingId] = data.split(":");
+
+      if (!UUID_RE.test(bookingId)) {
+        await answerCallbackQuery(callbackId, "Invalid action.");
+        return;
+      }
+
+      const isAccept = action === "accept";
+      await answerCallbackQuery(
+        callbackId,
+        isAccept ? "Confirm this booking?" : "Decline this booking?"
+      );
+      await editTelegramReplyMarkup(chatId, messageId, {
+        inline_keyboard: [
+          [
+            {
+              text: isAccept ? "✅ Yes, confirm" : "❌ Yes, decline",
+              callback_data: `yes_${action}:${bookingId}`,
+            },
+            { text: "↩️ Back", callback_data: `back:${bookingId}` },
+          ],
+        ],
+      });
       return;
     }
+
+    // Step 2: user confirmed -> actually do it
+if (data.startsWith("yes_accept:") || data.startsWith("yes_decline:")) {
+  await handleBookingStatusCallback(callback_query);
+  return;
+}
+
+// Cancel: restore the original buttons
+if (data.startsWith("back:")) {
+  const bookingId = data.replace("back:", "").trim();
+  if (!UUID_RE.test(bookingId)) {
+    await answerCallbackQuery(callbackId, "Invalid action.");
+    return;
+  }
+  await answerCallbackQuery(callbackId);
+  await editTelegramReplyMarkup(chatId, messageId, {
+    inline_keyboard: [
+      [
+        { text: "✅ Accept", callback_data: `accept:${bookingId}` },
+        { text: "❌ Decline", callback_data: `decline:${bookingId}` },
+      ],
+    ],
+  });
+  return;
+}
 
     // --- Action: Merchant confirms account connection (sess_ or pg_) ---
     if (data.startsWith("confirm_tg:")) {

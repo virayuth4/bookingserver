@@ -838,7 +838,7 @@ router.get('/booking/availability', async (req, res) => {
 
   try {
     const pageResult = await zingoPool.query(
-      `SELECT opening_hours, max_bookings_per_slot FROM booking_pages WHERE id = $1`,
+      `SELECT opening_hours, max_capacity_per_slot FROM booking_pages WHERE id = $1`,
       [pageId]
     );
     const page = pageResult.rows[0];
