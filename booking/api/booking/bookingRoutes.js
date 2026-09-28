@@ -17,7 +17,8 @@ const { formatRequestedAt, formatBookingDate, formatBookingTime } = require("../
 // ---------------------------------------------------------------------------
 
 const BOOKING_TABLE = 'booking_pages';
-const MAX_GALLERY_IMAGES = 5;
+const MAX_IMAGES_PER_ROW = 5;
+const MAX_TOTAL_IMAGES = 40; // sanity cap across all rows combined; adjust as you like
 const MAX_CLOSED_DATES = 366;
 const DAY_KEYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -26,10 +27,19 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const PLAN_LIMITS = { basic: 1, pro: 10 };
 const DEFAULT_PLAN = 'basic';
 
-const bookingUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
-const handleBookingMulter = bookingUpload.fields([
-  { name: 'images', maxCount: MAX_GALLERY_IMAGES },
-]);
+const bookingUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB per file
+    files: MAX_TOTAL_IMAGES,    // hard cap on total files per request, across all rows
+  },
+});
+
+// Field names are dynamic ("images_row_0", "images_row_1", ...) since rows are
+// user-defined, so we can't use .fields() with a fixed list. .any() accepts
+// any field name; groupNewFilesByRow() below filters req.files down to only
+// fieldnames matching /^images_row_(\d+)$/ and silently drops anything else.
+const handleBookingMulter = bookingUpload.any();
 
 function parseJsonField(raw, fallback) {
   if (raw === undefined || raw === null || raw === '') return fallback;
@@ -146,6 +156,119 @@ function parseExistingImagePaths(raw) {
   } catch {
     return [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// Image row helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parses the "image_rows_meta" field sent by the client:
+ *   [{ label, existing_image_paths: [url, ...] }, ...]
+ * Returns { value, error }.
+ */
+function parseImageRowsMeta(raw) {
+  if (!raw) return { value: [] };
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { error: 'Invalid image rows data.' };
+  }
+  if (!Array.isArray(parsed)) return { error: 'Invalid image rows data.' };
+
+  const value = [];
+  for (const row of parsed) {
+    const label = (row?.label || '').toString().trim();
+    if (!label) return { error: 'Each photo row needs a name.' };
+    const existing = Array.isArray(row?.existing_image_paths)
+      ? row.existing_image_paths.filter((u) => typeof u === 'string')
+      : [];
+    if (existing.length > MAX_IMAGES_PER_ROW) {
+      return { error: `"${label}" can have up to ${MAX_IMAGES_PER_ROW} photos.` };
+    }
+    value.push({ label, existing_image_paths: existing });
+  }
+  return { value };
+}
+
+/**
+ * req.files comes back flat from multer.any(). Groups them by row index
+ * based on fieldname "images_row_<idx>".
+ * Returns a Map<number, Express.Multer.File[]>.
+ */
+function groupNewFilesByRow(files) {
+  const byRow = new Map();
+  const re = /^images_row_(\d+)$/;
+  for (const file of files || []) {
+    const match = re.exec(file.fieldname);
+    if (!match) continue; // ignore anything unexpected
+    const idx = Number(match[1]);
+    if (!byRow.has(idx)) byRow.set(idx, []);
+    byRow.get(idx).push(file);
+  }
+  return byRow;
+}
+
+/**
+ * Builds the final image_rows array (label + all image paths per row),
+ * uploading any new files to S3 along the way.
+ * rowsMeta: [{ label, existing_image_paths }]
+ * newFilesByRow: Map<number, Express.Multer.File[]>
+ */
+async function buildImageRows(rowsMeta, newFilesByRow, slug) {
+  const imageRows = [];
+  let totalCount = 0;
+
+  for (let idx = 0; idx < rowsMeta.length; idx++) {
+    const { label, existing_image_paths: existing } = rowsMeta[idx];
+    const newFiles = newFilesByRow.get(idx) || [];
+
+    if (existing.length + newFiles.length > MAX_IMAGES_PER_ROW) {
+      throw Object.assign(new Error(`"${label}" can have up to ${MAX_IMAGES_PER_ROW} photos.`), {
+        status: 400,
+      });
+    }
+
+    let uploaded = [];
+    if (newFiles.length) {
+      uploaded = await uploadMediaFilesToS3(newFiles, slug, 'image', {
+        pathPrefix: 'eatdoko/booking-pages/gallery',
+      });
+    }
+
+    const paths = [...existing, ...uploaded];
+    totalCount += paths.length;
+    imageRows.push({ label, image_paths: paths });
+  }
+
+  if (totalCount > MAX_TOTAL_IMAGES) {
+    throw Object.assign(new Error(`You can upload up to ${MAX_TOTAL_IMAGES} photos in total.`), {
+      status: 400,
+    });
+  }
+
+  return imageRows;
+}
+
+/** Flattens every image_paths url across all rows of a stored image_rows value. */
+function flattenImageRowPaths(imageRows) {
+  if (!Array.isArray(imageRows)) return [];
+  return imageRows.flatMap((row) => (Array.isArray(row?.image_paths) ? row.image_paths : []));
+}
+
+/**
+ * Reads whichever gallery shape a page row currently has — new "image_rows"
+ * JSONB column if present/populated, otherwise the legacy flat "image_paths"
+ * column folded into a single "Photos" row. Use this everywhere a page needs
+ * to be treated as a list of rows, so old, not-yet-resaved pages keep working.
+ */
+function normalizeImageRows(page) {
+  if (Array.isArray(page.image_rows) && page.image_rows.length) {
+    return page.image_rows;
+  }
+  const legacy = parseExistingImagePaths(page.image_paths);
+  return legacy.length ? [{ label: 'Photos', image_paths: legacy }] : [];
 }
 
 // Single definition (the duplicate has been removed)
@@ -346,11 +469,9 @@ router.get('/booking-settings', authenticateFirebaseToken, async (req, res) => {
     const merchantId = req.user?.id;
     if (!merchantId) return res.status(401).json({ error: 'Unauthorized.' });
 
-    
-
     const [pagesResult, plan] = await Promise.all([
       zingoPool.query(
-        `SELECT "id", "name", "slug", "image_paths", "phone", "telegram", "telegram_chat_id", "map_url",
+        `SELECT "id", "name", "slug", "image_rows", "image_paths", "phone", "telegram", "telegram_chat_id", "map_url",
                 "opening_hours", "closed_dates", "created_at", "updated_at"
          FROM "booking_pages" WHERE "merchant_id" = $1 ORDER BY "created_at" ASC`,
         [merchantId]
@@ -358,8 +479,15 @@ router.get('/booking-settings', authenticateFirebaseToken, async (req, res) => {
       getMerchantPlan(merchantId),
     ]);
 
+    // Normalize so the list view always sees "image_rows", even for pages
+    // that haven't been re-saved since the migration yet.
+    const data = pagesResult.rows.map((page) => ({
+      ...page,
+      image_rows: normalizeImageRows(page),
+    }));
+
     return res.status(200).json({
-      data: pagesResult.rows,
+      data,
       plan,
       limit: PLAN_LIMITS[plan] ?? PLAN_LIMITS[DEFAULT_PLAN],
     });
@@ -377,23 +505,29 @@ router.get('/booking-settings/id/:id', authenticateFirebaseToken, async (req, re
     if (!merchantId) return res.status(401).json({ error: 'Unauthorized.' });
 
     const pageId = Number(req.params.id);
+    if (!Number.isInteger(pageId)) {
+      return res.status(400).json({ error: 'Invalid page id.' });
+    }
+
     const page = await getPageForMerchant(pageId, merchantId);
+
     if (!page) return res.status(404).json({ error: 'Booking page not found.' });
 
-    return res.status(200).json({ data: page });
+    if (page.merchant_id !== merchantId) {
+      return res.status(404).json({ error: 'Booking page not found.' });
+    }
+
+    return res.status(200).json({ data: { ...page, image_rows: normalizeImageRows(page) } });
   } catch (error) {
     console.error('Error loading booking page:', error);
     return res.status(500).json({ error: 'Failed to load booking page.' });
   }
 });
-
 // ---------------------------------------------------------------------------
 // GET /booking-settings/:slug — load one page 
 // ---------------------------------------------------------------------------
 router.get('/booking-settings/slug/:slug',  async (req, res) => {
   try {
-  
-
     const slug = req.params.slug;
     if (!slug || typeof slug !== 'string') {
       return res.status(400).json({ error: 'Invalid page slug.' });
@@ -402,7 +536,7 @@ router.get('/booking-settings/slug/:slug',  async (req, res) => {
     const page = await getPageForMerchantBySlug(slug);
     if (!page) return res.status(404).json({ error: 'Booking page not found.' });
 
-    return res.status(200).json({ data: page });
+    return res.status(200).json({ data: { ...page, image_rows: normalizeImageRows(page) } });
   } catch (error) {
     console.error('Error loading booking page:', error);
     return res.status(500).json({ error: 'Failed to load booking page.' });
@@ -484,21 +618,22 @@ router.post('/booking-settings', authenticateFirebaseToken, handleBookingMulter,
     const closedResult = parseClosedDates(req.body.closedDates);
     if (closedResult.error) return res.status(400).json({ error: closedResult.error });
 
-    const newImageFiles = req.files?.images || [];
-    if (newImageFiles.length > MAX_GALLERY_IMAGES) {
-      return res.status(400).json({ error: `You can upload up to ${MAX_GALLERY_IMAGES} photos.` });
-    }
+    // --- Image rows ---
+    const rowsMetaResult = parseImageRowsMeta(req.body.image_rows_meta);
+    if (rowsMetaResult.error) return res.status(400).json({ error: rowsMetaResult.error });
 
-    let imagePaths = [];
-    if (newImageFiles.length) {
-      imagePaths = await uploadMediaFilesToS3(newImageFiles, slug, 'image', {
-        pathPrefix: 'eatdoko/booking-pages/gallery',
-      });
+    const newFilesByRow = groupNewFilesByRow(req.files);
+
+    let imageRows = [];
+    try {
+      imageRows = await buildImageRows(rowsMetaResult.value, newFilesByRow, slug);
+    } catch (err) {
+      return res.status(err.status || 500).json({ error: err.message });
     }
 
     const result = await zingoPool.query(
       `INSERT INTO "booking_pages" (
-         "merchant_id", "name", "slug", "image_paths",
+         "merchant_id", "name", "slug", "image_rows",
          "phone", "telegram", "telegram_chat_id", "map_url", "opening_hours", "closed_dates",
          "category", "service_types"
        )
@@ -508,7 +643,7 @@ router.post('/booking-settings', authenticateFirebaseToken, handleBookingMulter,
         merchantId,
         name,
         slug,
-        JSON.stringify(imagePaths),
+        JSON.stringify(imageRows),
         phoneValue,
         telegramValue,
         telegramChatIdValue ?? null,
@@ -522,7 +657,7 @@ router.post('/booking-settings', authenticateFirebaseToken, handleBookingMulter,
 
     return res.status(201).json({
       message: 'Booking page created.',
-      data: { id: result.rows[0].id, slug: result.rows[0].slug, image_paths: imagePaths },
+      data: { id: result.rows[0].id, slug: result.rows[0].slug, image_rows: imageRows },
     });
   } catch (error) {
     console.error('Error creating booking page:', error);
@@ -596,31 +731,32 @@ router.put('/booking-settings/:id', authenticateFirebaseToken, handleBookingMult
     const closedResult = parseClosedDates(req.body.closedDates);
     if (closedResult.error) return res.status(400).json({ error: closedResult.error });
 
-    const existingImagePaths = parseExistingImagePaths(existing.image_paths);
-    const keptImagePaths = parseExistingImagePaths(req.body.existing_image_paths);
-    const removedImagePaths = existingImagePaths.filter((url) => !keptImagePaths.includes(url));
+    // --- Image rows ---
+    const rowsMetaResult = parseImageRowsMeta(req.body.image_rows_meta);
+    if (rowsMetaResult.error) return res.status(400).json({ error: rowsMetaResult.error });
 
-    const newImageFiles = req.files?.images || [];
-    if (keptImagePaths.length + newImageFiles.length > MAX_GALLERY_IMAGES) {
-      return res.status(400).json({ error: `You can upload up to ${MAX_GALLERY_IMAGES} photos.` });
+    // existing image gallery, whichever shape it's currently stored in
+    // (new image_rows column, or the legacy flat image_paths column).
+    const existingImageRows = normalizeImageRows(existing);
+    const previousPaths = flattenImageRowPaths(existingImageRows);
+    const newFilesByRow = groupNewFilesByRow(req.files);
+
+    let imageRows = [];
+    try {
+      imageRows = await buildImageRows(rowsMetaResult.value, newFilesByRow, slug);
+    } catch (err) {
+      return res.status(err.status || 500).json({ error: err.message });
     }
 
-    let uploadedImagePaths = [];
-    if (newImageFiles.length) {
-      uploadedImagePaths = await uploadMediaFilesToS3(newImageFiles, slug, 'image', {
-        pathPrefix: 'eatdoko/booking-pages/gallery',
-      });
-    }
-
+    const keptPaths = flattenImageRowPaths(imageRows);
+    const removedImagePaths = previousPaths.filter((url) => !keptPaths.includes(url));
     if (removedImagePaths.length) {
       cleanupRemovedImages(removedImagePaths);
     }
 
-    const finalImagePaths = [...keptImagePaths, ...uploadedImagePaths];
-
     const result = await zingoPool.query(
       `UPDATE "booking_pages"
-       SET "name" = $1, "slug" = $2, "image_paths" = $3, "phone" = $4, "telegram" = $5,
+       SET "name" = $1, "slug" = $2, "image_rows" = $3, "phone" = $4, "telegram" = $5,
            "telegram_chat_id" = $6, "map_url" = $7, "opening_hours" = $8, "closed_dates" = $9,
            "category" = $10, "service_types" = $11, "updated_at" = now()
        WHERE "id" = $12 AND "merchant_id" = $13
@@ -628,7 +764,7 @@ router.put('/booking-settings/:id', authenticateFirebaseToken, handleBookingMult
       [
         name,
         slug,
-        JSON.stringify(finalImagePaths),
+        JSON.stringify(imageRows),
         phoneValue,
         telegramValue,
         telegramChatIdValue,
@@ -644,7 +780,7 @@ router.put('/booking-settings/:id', authenticateFirebaseToken, handleBookingMult
 
     return res.status(200).json({
       message: 'Booking page saved.',
-      data: { id: result.rows[0].id, slug: result.rows[0].slug, image_paths: finalImagePaths },
+      data: { id: result.rows[0].id, slug: result.rows[0].slug, image_rows: imageRows },
     });
   } catch (error) {
     console.error('Error saving booking page:', error);
@@ -669,7 +805,9 @@ router.delete('/booking-settings/:id', authenticateFirebaseToken, async (req, re
     const existing = await getPageForMerchant(pageId, merchantId);
     if (!existing) return res.status(404).json({ error: 'Booking page not found.' });
 
-    const removed = parseExistingImagePaths(existing.image_paths);
+    // Clean up every image across every row (new image_rows shape or legacy
+    // flat image_paths, whichever this page currently has).
+    const removed = flattenImageRowPaths(normalizeImageRows(existing));
     if (removed.length) {
       cleanupRemovedImages(removed);
     }
