@@ -52,35 +52,35 @@ function parseJsonField(raw, fallback) {
   }
 }
 
+const getSlots = (day) => {
+  if (!day || day.closed) return [];
+  if (Array.isArray(day.slots) && day.slots.length) return day.slots;
+  if (day.open && day.close) return [{ open: day.open, close: day.close }];
+  return [];
+};
+
 function parseHours(raw) {
-  const hours = parseJsonField(raw, undefined);
-  if (!hours || typeof hours !== 'object') {
-    return { error: 'Opening hours are required.' };
+  let obj;
+  try { obj = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return { error: 'Invalid opening hours.' }; }
+  if (!obj || typeof obj !== 'object') return { error: 'Invalid opening hours.' };
+
+  const out = {};
+  for (const k of DAY_KEYS) {
+    const d = obj[k];
+    if (!d) return { error: `Missing hours for ${k}.` };
+    if (d.closed) { out[k] = { closed: true, slots: [] }; continue; }
+
+    // accept legacy {open, close} too
+    const rawSlots = Array.isArray(d.slots) && d.slots.length ? d.slots : [{ open: d.open, close: d.close }];
+    if (rawSlots.length > 3) return { error: `Too many time ranges on ${k}.` };
+    for (const s of rawSlots) {
+      if (!TIME_RE.test(s.open) || !TIME_RE.test(s.close)) return { error: `Invalid time on ${k}.` };
+    }
+    const slots = rawSlots.map(({ open, close }) => ({ open, close }))
+                          .sort((a, b) => a.open.localeCompare(b.open));
+    out[k] = { closed: false, open: slots[0].open, close: slots[0].close, slots };
   }
-
-  const clean = {};
-  for (const key of DAY_KEYS) {
-    const day = hours[key];
-    if (!day || typeof day !== 'object') {
-      return { error: `Missing opening hours for ${key}.` };
-    }
-
-    if (day.closed) {
-      clean[key] = { closed: true, open: null, close: null };
-      continue;
-    }
-
-    if (!TIME_RE.test(day.open || '') || !TIME_RE.test(day.close || '')) {
-      return { error: `Set valid opening and closing times for ${key}, or mark it closed.` };
-    }
-    if (day.close <= day.open) {
-      return { error: `Closing time must be after opening time for ${key}.` };
-    }
-
-    clean[key] = { closed: false, open: day.open, close: day.close };
-  }
-
-  return { value: clean };
+  return { value: out };
 }
 
 function parseClosedDates(raw) {
@@ -845,12 +845,10 @@ router.get('/booking/availability', async (req, res) => {
     if (!page) return res.status(404).json({ error: 'Page not found.' });
 
     const dayKey = ['sun','mon','tue','wed','thu','fri','sat'][new Date(`${date}T00:00:00`).getDay()];
-    const dayHours = page.opening_hours?.[dayKey];
-
-    if (!dayHours || dayHours.closed) {
+   const dayHours = page.opening_hours?.[dayKey];
+    if (getSlots(dayHours).length === 0) {
       return res.json({ slots: [] });
     }
-
     // Whole-day manual block (section-specific or blanket)
     const dayBlockResult = await zingoPool.query(
       `SELECT 1 FROM blocked_slots
@@ -888,21 +886,37 @@ router.get('/booking/availability', async (req, res) => {
       bookingsResult.rows.map((r) => [r.start_time.slice(0, 5), r.count])
     );
 
-    // Build 30-min slots across opening hours
-    const toMinutes = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
-    const toTime = (mins) => `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`;
+   const toMinutes = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
+  const toTime = (mins) => {
+    const wrapped = mins % 1440; // handles shifts that run past midnight
+    return `${String(Math.floor(wrapped / 60)).padStart(2, '0')}:${String(wrapped % 60).padStart(2, '0')}`;
+  };
 
-    const slots = [];
-    for (let m = toMinutes(dayHours.open); m < toMinutes(dayHours.close); m += 30) {
+  const maxPerSlot = page.max_capacity_per_slot ?? Infinity;
+  const seen = new Set();
+  const slots = [];
+
+  const ranges = [...getSlots(dayHours)].sort((a, b) => a.open.localeCompare(b.open));
+
+  for (const range of ranges) {
+    const start = toMinutes(range.open);
+    let end = toMinutes(range.close);
+    if (end <= start) end += 1440; // e.g. 18:00–02:00
+
+    for (let m = start; m < end; m += 30) {
       const time = toTime(m);
+      if (seen.has(time)) continue; // guard against overlapping ranges
+      seen.add(time);
+
       const bookedCount = bookedCounts.get(time) || 0;
       const manuallyBlocked = blockedTimes.has(time);
-      const full = bookedCount >= page.max_bookings_per_slot;
+      const full = bookedCount >= maxPerSlot;
 
       slots.push({ time, available: !manuallyBlocked && !full });
     }
+  }
 
-    return res.json({ slots });
+  return res.json({ slots });
   } catch (err) {
     console.error('Availability error:', err);
     return res.status(500).json({ error: 'Could not load availability.' });

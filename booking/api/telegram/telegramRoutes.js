@@ -16,15 +16,174 @@ const { escapeHtml, formatBookingDate, formatBookingTime } = require("../../../l
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
 const CUSTOMER_TELEGRAM_API = `https://api.telegram.org/bot${process.env.ACME_RESERVE_CUSTOMER_BOT_TOKEN}`;
 
+// =============================================================================
+// Booking status state machine
+//
+//   pending ──accept──▶ confirmed ──complete──▶ completed
+//      │                    ├──────noshow────▶ no_show
+//      └──decline─▶ declined └──────cancel────▶ cancelled
+// =============================================================================
 
-function replaceBookingHeader(originalText, newStatus) {
-  const headerEn = newStatus === "confirmed" ? "✅ Booking confirmed" : "❌ Booking declined";
-  const headerKm = newStatus === "confirmed" ? "✅ បានបញ្ជាក់កក់ទីតាំង" : "❌ បដិសេធការកក់ទីតាំង";
- 
-  return originalText
-    .replace(/^📅 New booking request/m, headerEn)
-    .replace(/^📅 សំណើកក់ទីតាំងថ្មី/m, headerKm);
+// action -> what it does. `from` = statuses the action is allowed from.
+// `afterStart` = only allowed once the booking start time has passed.
+const STATUS_ACTIONS = {
+  accept:   { to: "confirmed", from: ["pending"],   label: "confirm" },
+  decline:  { to: "declined",  from: ["pending"],   label: "decline" },
+  complete: { to: "completed", from: ["confirmed"], label: "mark completed" },
+  noshow:   { to: "no_show",   from: ["confirmed"], label: "mark no show", afterStart: true },
+  cancel:   { to: "cancelled", from: ["confirmed"], label: "cancel" },
+};
+
+// status -> header text (English / Khmer) + verb used in the footer line
+const STATUS_META = {
+  confirmed: { en: "✅ Booking confirmed",  km: "✅ បានបញ្ជាក់កក់ទីតាំង",  verb: "Confirmed" },
+  declined:  { en: "❌ Booking declined",   km: "❌ បដិសេធការកក់ទីតាំង",    verb: "Declined" },
+  completed: { en: "🎉 Booking completed",  km: "🎉 ការកក់បានបញ្ចប់",       verb: "Completed" },
+  no_show:   { en: "🚫 No show",            km: "🚫 មិនបានមក",              verb: "Marked as no show" },
+  cancelled: { en: "🗑 Booking cancelled",  km: "🗑 ការកក់ត្រូវបានលុបចោល", verb: "Cancelled" },
+};
+
+// Buttons shown on a new (pending) request
+const PENDING_KEYBOARD = (id) => ({
+  inline_keyboard: [
+    [
+      { text: "✅ Accept", callback_data: `accept:${id}` },
+      { text: "❌ Decline", callback_data: `decline:${id}` },
+    ],
+  ],
+});
+
+// Buttons shown after a booking is confirmed
+const CONFIRMED_KEYBOARD = (id) => ({
+  inline_keyboard: [
+    [
+      { text: "🎉 Completed", callback_data: `complete:${id}` },
+      { text: "🚫 No show", callback_data: `noshow:${id}` },
+    ],
+    [{ text: "🗑 Cancel booking", callback_data: `cancel:${id}` }],
+  ],
+});
+
+// Only "pending" and "confirmed" have buttons; everything else is terminal
+function keyboardForStatus(status, bookingId) {
+  if (status === "pending") return PENDING_KEYBOARD(bookingId);
+  if (status === "confirmed") return CONFIRMED_KEYBOARD(bookingId);
+  return null;
 }
+
+// Replace ONLY the first line of the message with the header for `status`,
+// keeping the language (Khmer vs English) of the original header.
+function replaceBookingHeader(originalText, status) {
+  const meta = STATUS_META[status];
+  if (!meta) return originalText;
+  const firstLine = originalText.split("\n")[0] || "";
+  const isKhmer = /[\u1780-\u17FF]/.test(firstLine);
+  return originalText.replace(/^[^\n]*/, isKhmer ? meta.km : meta.en);
+}
+
+// Status footer is appended after this separator. We strip it before each
+// transition so footers don't pile up.
+const FOOTER_SEP = "\n\n──────────";
+function stripFooter(text) {
+  return text.split(FOOTER_SEP)[0];
+}
+
+// Builds the full edited message text (already HTML-escaped, since
+// callbackQuery.message.text is plain text and we send with parse_mode HTML).
+function buildUpdatedMessage(originalText, status, responderName, booking) {
+  const meta = STATUS_META[status];
+  const base = replaceBookingHeader(stripFooter(originalText || ""), status);
+  const statusLine = `${meta.verb} by ${responderName || "someone"}`;
+
+  // Phone numbers in plain Telegram message text are auto-linkified on
+  // mobile — tapping one offers Call / Message / Copy, so no button
+  // (and no tel:/sms: URL scheme, which inline keyboards don't support) needed.
+  const contactLine = booking?.phone
+    ? `\nCustomer: ${booking.full_name}: ${booking.phone}`
+    : "";
+
+  return escapeHtml(`${base}${FOOTER_SEP}\n${statusLine}${contactLine}`);
+}
+
+// Message sent to the customer's own chat. Returns null when we stay silent.
+function buildBookerText(booking) {
+  const businessName = escapeHtml(booking.business_name || "the business");
+
+  const dateLine = booking.booking_date
+    ? `\n📅 Date: ${escapeHtml(formatBookingDate(booking.booking_date))}`
+    : "";
+  const timeLine = booking.start_time
+    ? `\n⏰ Time: ${escapeHtml(formatBookingTime(booking.start_time))}`
+    : "";
+  const partyLine = booking.guests ? `\n👥 Party size: ${escapeHtml(String(booking.guests))}` : "";
+  const notesLine = booking.note ? `\n📝 Notes: ${escapeHtml(booking.note)}` : "";
+  const detailsBlock = `${dateLine}${timeLine}${partyLine}${notesLine}`;
+
+  // merchant_telegram_chat_id is a raw numeric chat id, not a shareable
+  // t.me/ link — it only lets *your bot* message that chat server-side.
+  // Swap in a real @username or phone number from booking_pages if you
+  // have one, for something the booker can actually tap/use.
+  const merchantContact = escapeHtml(
+    [booking.merchant_telegram, booking.merchant_phone].filter(Boolean).join(" or ") || "the business"
+  );
+  const trackingLine = `\n\n<a href="${process.env.NEXT_PUBLIC_FRONTEND}/my-bookings/${booking.id}">View your booking here</a>`;
+
+  switch (booking.status) {
+    case "confirmed":
+      return `✅ <b>Your booking at ${businessName} is confirmed!</b>${detailsBlock}\n\nIf you need to make any changes, please contact the merchant directly at: ${merchantContact}.${trackingLine}`;
+    case "declined":
+      return `❌ <b>Your booking at ${businessName} was declined.</b>${detailsBlock}\n\nPlease try a different time, or contact the merchant directly if you have questions.${trackingLine}`;
+    case "cancelled":
+      return `🗑 <b>Your booking at ${businessName} was cancelled by the business.</b>${detailsBlock}\n\nPlease contact the merchant directly at: ${merchantContact} if you have questions.${trackingLine}`;
+    case "completed":
+      return `🎉 <b>Thanks for visiting ${businessName}!</b>${detailsBlock}${trackingLine}`;
+    default:
+      return null; // no_show: stay silent
+  }
+}
+
+// Shared by Telegram + dashboard so the transition rules live in one place.
+// Returns the updated booking row, or null if the transition isn't allowed
+// (already handled, wrong current status, or too early for no-show).
+async function applyBookingStatus(client, { bookingId, action, actorId, actorName, actorLabel }) {
+  const cfg = STATUS_ACTIONS[action];
+  if (!cfg) return null;
+
+  const startedClause = cfg.afterStart
+    ? `AND b.booking_date IS NOT NULL AND b.start_time IS NOT NULL
+       AND (b.booking_date + b.start_time) < now()`
+    : "";
+
+  const { rows } = await client.query(
+    `UPDATE bookings b
+     SET status = $1,
+         responded_at = now(),
+         responded_by_id = $2,
+         responded_by_name = $3
+     FROM booking_pages bp
+     WHERE b.id = $4
+       AND b.status = ANY($5)
+       AND bp.id = b.booking_page_id
+       ${startedClause}
+     RETURNING b.*, bp.name AS business_name, bp.telegram AS merchant_telegram, bp.phone AS merchant_phone;`,
+    [cfg.to, actorId, actorName, bookingId, cfg.from]
+  );
+
+  const booking = rows[0];
+  if (!booking) return null;
+
+  await client.query(
+    `INSERT INTO booking_events (booking_id, type, payload, actor)
+     VALUES ($1, $2, $3, $4);`,
+    [booking.id, cfg.to, JSON.stringify(booking), actorLabel || `telegram:${actorId}`]
+  );
+
+  return booking;
+}
+
+// =============================================================================
+// Telegram helpers
+// =============================================================================
 
 // Helper to send messages
 async function sendTelegramMessage(chatId, text, replyMarkup = null, api = TELEGRAM_API) {
@@ -78,6 +237,10 @@ async function answerCallbackQuery(callbackQueryId, text = "") {
   }
 }
 
+// =============================================================================
+// Handles every "yes_<action>:<bookingId>" tap (accept, decline, complete,
+// noshow, cancel)
+// =============================================================================
 async function handleBookingStatusCallback(callbackQuery) {
   const callbackId = callbackQuery.id;
   const chatId = callbackQuery.message.chat.id;
@@ -88,126 +251,84 @@ async function handleBookingStatusCallback(callbackQuery) {
     ? `@${callbackQuery.from.username}`
     : callbackQuery.from.first_name;
 
-
   const [rawAction, bookingId] = data.split(":");
-  const action = rawAction.replace(/^yes_/, ""); // "yes_accept" -> "accept"
+  const action = rawAction.replace(/^yes_/, ""); // "yes_complete" -> "complete"
+  const cfg = STATUS_ACTIONS[action];
 
- if (!["accept", "decline"].includes(action) || !UUID_RE.test(bookingId)) {
+  if (!cfg || !UUID_RE.test(bookingId)) {
     await answerCallbackQuery(callbackId, "Invalid action.");
     return;
   }
 
-  const newStatus = action === "accept" ? "confirmed" : "declined";
   const client = await zingoPool.connect();
 
   try {
     await client.query("BEGIN");
 
-   const updateResult = await client.query(
-    `UPDATE bookings b
-    SET status = $1,
-        responded_at = now(),
-        responded_by_id = $2,
-        responded_by_name = $3
-    FROM booking_pages bp
-    WHERE b.id = $4 AND b.status = 'pending' AND bp.id = b.booking_page_id
-    RETURNING b.*, bp.name AS business_name, bp.telegram AS merchant_telegram, bp.phone AS merchant_phone;`,
-    [newStatus, respondedBy, responderName, bookingId]
-  );
-
-    const booking = updateResult.rows[0];
+    const booking = await applyBookingStatus(client, {
+      bookingId,
+      action,
+      actorId: respondedBy,
+      actorName: responderName,
+    });
 
     if (!booking) {
       await client.query("ROLLBACK");
 
       // Look up what it actually is now, and sync the message to reality
-     const current = await client.query(
+      const current = await client.query(
         `SELECT b.*, bp.name AS business_name, bp.telegram AS merchant_telegram, bp.phone AS merchant_phone
-        FROM bookings b
-        JOIN booking_pages bp ON bp.id = b.booking_page_id
-        WHERE b.id = $1`,
+         FROM bookings b
+         JOIN booking_pages bp ON bp.id = b.booking_page_id
+         WHERE b.id = $1`,
         [bookingId]
       );
       const b = current.rows[0];
 
-      await answerCallbackQuery(callbackId, "Already handled.");
+      // The action would have been valid for this status, so it must have been
+      // blocked by the "not started yet" rule (no-show).
+      const blockedByTime = b && cfg.from.includes(b.status) && cfg.afterStart;
+      await answerCallbackQuery(
+        callbackId,
+        blockedByTime ? "Too early — booking hasn't started yet." : "Already handled."
+      );
 
       if (b) {
         const originalText = callbackQuery.message?.text || "";
-        const statusLine =
-          b.status === "confirmed" ? `✅ Confirmed by ${b.responded_by_name || "someone"}` :
-          b.status === "declined"  ? `❌ Declined by ${b.responded_by_name || "someone"}` :
-          `Status: ${b.status}`;
+        const keyboard = keyboardForStatus(b.status, b.id);
 
-        const contactLine = b.phone
-          ? `\nNotify your customer at: ${b.full_name}: ${b.phone}`
-          : "";
+        // Terminal / confirmed states get a synced header + footer.
+        // A still-pending booking just gets its original buttons back.
+        const text = STATUS_META[b.status]
+          ? buildUpdatedMessage(originalText, b.status, b.responded_by_name, b)
+          : escapeHtml(stripFooter(originalText));
 
-        // Edit with no replyMarkup arg → Telegram drops the inline keyboard
-        const headerSwapped = replaceBookingHeader(originalText, b.status);
-        await editTelegramMessage(chatId, messageId, `${headerSwapped}\n\n${statusLine}${contactLine}`);
+        // Edit with no replyMarkup → Telegram drops the inline keyboard.
+        // For confirmed/pending we pass the right keyboard so buttons don't vanish.
+        await editTelegramMessage(chatId, messageId, text, keyboard);
       }
       return; // finally{} still releases the client — no manual release() here
     }
 
-    await client.query(
-      `INSERT INTO booking_events (booking_id, type, payload, actor)
-       VALUES ($1, $2, $3, $4);`,
-      [booking.id, newStatus, JSON.stringify(booking), `telegram:${respondedBy}`]
-    );
-
     await client.query("COMMIT");
 
-    await answerCallbackQuery(
-      callbackId,
-      newStatus === "confirmed" ? "Booking confirmed ✅" : "Booking declined ❌"
+    await answerCallbackQuery(callbackId, STATUS_META[booking.status].en);
+
+    // Only "confirmed" keeps buttons (Completed / No show / Cancel).
+    await editTelegramMessage(
+      chatId,
+      messageId,
+      buildUpdatedMessage(callbackQuery.message?.text || "", booking.status, responderName, booking),
+      keyboardForStatus(booking.status, booking.id)
     );
 
-    const originalText = callbackQuery.message?.text || "";
-    const statusLine =
-      newStatus === "confirmed"
-        ? `✅ Confirmed by ${responderName}`
-        : `❌ Declined by ${responderName}`;
-
-    // Phone numbers in plain Telegram message text are auto-linkified on
-    // mobile — tapping one offers Call / Message / Copy, so no button
-    // (and no tel:/sms: URL scheme, which inline keyboards don't support) needed.
-    const contactLine = booking.phone
-      ? `\nNotify your customer at: ${booking.full_name}: ${booking.phone}`
-      : "";
-
-     await editTelegramMessage(chatId, messageId, `${replaceBookingHeader(originalText, newStatus)}\n\n${statusLine}${contactLine}`);
-
     // Notify the booker (customer) on their own chat, if they've connected Telegram
-if (booking.telegram_chat_id) {
-  const businessName = escapeHtml(booking.business_name || "the business");
-
-  const dateLine = booking.booking_date
-        ? `\n📅 Date: ${escapeHtml(formatBookingDate(booking.booking_date))}`
-        : "";
-      const timeLine = booking.start_time
-        ? `\n⏰ Time: ${escapeHtml(formatBookingTime(booking.start_time))}`
-        : "";
-  const partyLine = booking.guests ? `\n👥 Party size: ${escapeHtml(String(booking.guests))}` : "";
-  const notesLine = booking.note ? `\n📝 Notes: ${escapeHtml(booking.note)}` : "";
-  const detailsBlock = `${dateLine}${timeLine}${partyLine}${notesLine}`;
-
-  // merchant_telegram_chat_id is a raw numeric chat id, not a shareable
-  // t.me/ link — it only lets *your bot* message that chat server-side.
-  // Swap in a real @username or phone number from booking_pages if you
-  // have one, for something the booker can actually tap/use.
-    const merchantContact =
-     [booking.merchant_telegram, booking.merchant_phone].filter(Boolean).join(" or ") || "the business";
-     const trackingLine = `\n\n<a href="${process.env.NEXT_PUBLIC_FRONTEND}/my-bookings/${booking.id}">View your booking here</a>`;
-  
-  const bookerText =
-    newStatus === "confirmed"
-      ? `✅ <b>Your booking at ${businessName} is confirmed!</b>${detailsBlock}\n\nIf you need to make any changes, please contact the merchant directly at: ${merchantContact}.${trackingLine}`
-      : `❌ <b>Your booking at ${businessName} was declined.</b>${detailsBlock}\n\nPlease try a different time, or contact the merchant directly if you have questions.${trackingLine}`;
-
-    const sent = await sendTelegramMessage(booking.telegram_chat_id, bookerText, null, CUSTOMER_TELEGRAM_API);
-
-}
+    if (booking.telegram_chat_id) {
+      const bookerText = buildBookerText(booking);
+      if (bookerText) {
+        await sendTelegramMessage(booking.telegram_chat_id, bookerText, null, CUSTOMER_TELEGRAM_API);
+      }
+    }
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("handleBookingStatusCallback error:", err);
@@ -240,6 +361,68 @@ router.get('/booking-notify-status/:bookingId', async (req, res) => {
   } catch (error) {
     console.error('Error checking booking telegram status:', error);
     return res.status(500).json({ error: 'Failed to check status.' });
+  }
+});
+
+// PATCH /api/booking-link/bookings/:id/status
+// Dashboard equivalent of the Telegram buttons. Body: { action: "complete" | "noshow" | "cancel" | "accept" | "decline" }
+router.patch('/bookings/:id/status', authenticateFirebaseToken, async (req, res) => {
+  const merchantId = req.user?.id;
+  const { id } = req.params;
+  const { action } = req.body || {};
+
+  if (!merchantId) return res.status(401).json({ error: 'Unauthorized.' });
+  if (!UUID_RE.test(id) || !STATUS_ACTIONS[action]) {
+    return res.status(400).json({ error: 'Invalid request.' });
+  }
+
+  const client = await zingoPool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Ownership check: the booking must belong to one of this merchant's pages
+    const own = await client.query(
+      `SELECT 1
+       FROM bookings b
+       JOIN booking_pages bp ON bp.id = b.booking_page_id
+       WHERE b.id = $1 AND bp.merchant_id = $2`,
+      [id, merchantId]
+    );
+    if (own.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: 'Booking not found.' });
+    }
+
+    const booking = await applyBookingStatus(client, {
+      bookingId: id,
+      action,
+      actorId: merchantId,
+      actorName: "Dashboard",
+      actorLabel: `dashboard:${merchantId}`,
+    });
+
+    if (!booking) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This booking's status can't be changed that way." });
+    }
+
+    await client.query("COMMIT");
+
+    // Notify the customer the same way the Telegram flow does
+    if (booking.telegram_chat_id) {
+      const bookerText = buildBookerText(booking);
+      if (bookerText) {
+        await sendTelegramMessage(booking.telegram_chat_id, bookerText, null, CUSTOMER_TELEGRAM_API);
+      }
+    }
+
+    return res.status(200).json({ status: booking.status });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error('Error updating booking status:', error);
+    return res.status(500).json({ error: 'Failed to update booking.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -503,7 +686,7 @@ router.post("/telegram-webhook", async (req, res) => {
           const businessName = escapeHtml(result.rows[0].business_name);
           await sendTelegramMessage(
             chatId,
-          `✅ You're set — we'll message you here as soon as your booking at <b>${businessName}</b> is confirmed.\nOr <a href="${process.env.NEXT_PUBLIC_FRONTEND}/my-bookings/${bookingId}">view your booking here</a>`
+            `✅ You're set — we'll message you here as soon as your booking at <b>${businessName}</b> is confirmed.\nOr <a href="${process.env.NEXT_PUBLIC_FRONTEND}/my-bookings/${bookingId}">view your booking here</a>`
           );
           return;
         }
@@ -526,58 +709,58 @@ router.post("/telegram-webhook", async (req, res) => {
     const chatId = callback_query.message.chat.id;
     const messageId = callback_query.message.message_id;
 
-    // --- Action: Booking accept/decline (merchant side) ---
-      if (data.startsWith("accept:") || data.startsWith("decline:")) {
+    // --- Booking status actions (merchant side) ---------------------------
+    // accept / decline / complete / noshow / cancel
+
+    // Step 1: tapped an action button -> ask "are you sure?"
+    {
       const [action, bookingId] = data.split(":");
+      const cfg = STATUS_ACTIONS[action];
+
+      if (cfg) {
+        if (!UUID_RE.test(bookingId)) {
+          await answerCallbackQuery(callbackId, "Invalid action.");
+          return;
+        }
+
+        await answerCallbackQuery(callbackId, `Sure you want to ${cfg.label}?`);
+        await editTelegramReplyMarkup(chatId, messageId, {
+          inline_keyboard: [
+            [
+              { text: `Yes, ${cfg.label}`, callback_data: `yes_${action}:${bookingId}` },
+              // "back_pending" or "back_confirmed" → restores the right keyboard
+              { text: "↩️ Back", callback_data: `back_${cfg.from[0]}:${bookingId}` },
+            ],
+          ],
+        });
+        return;
+      }
+    }
+
+    // Step 2: user confirmed -> actually do it
+    if (data.startsWith("yes_")) {
+      await handleBookingStatusCallback(callback_query);
+      return;
+    }
+
+    // Back: restore the original buttons for that state.
+    // Plain "back:" is kept so messages sent before this update still work.
+    if (data.startsWith("back_pending:") || data.startsWith("back_confirmed:") || data.startsWith("back:")) {
+      const [key, bookingId] = data.split(":");
 
       if (!UUID_RE.test(bookingId)) {
         await answerCallbackQuery(callbackId, "Invalid action.");
         return;
       }
 
-      const isAccept = action === "accept";
-      await answerCallbackQuery(
-        callbackId,
-        isAccept ? "Confirm this booking?" : "Decline this booking?"
+      await answerCallbackQuery(callbackId);
+      await editTelegramReplyMarkup(
+        chatId,
+        messageId,
+        key === "back_confirmed" ? CONFIRMED_KEYBOARD(bookingId) : PENDING_KEYBOARD(bookingId)
       );
-      await editTelegramReplyMarkup(chatId, messageId, {
-        inline_keyboard: [
-          [
-            {
-              text: isAccept ? "✅ Yes, confirm" : "❌ Yes, decline",
-              callback_data: `yes_${action}:${bookingId}`,
-            },
-            { text: "↩️ Back", callback_data: `back:${bookingId}` },
-          ],
-        ],
-      });
       return;
     }
-
-    // Step 2: user confirmed -> actually do it
-if (data.startsWith("yes_accept:") || data.startsWith("yes_decline:")) {
-  await handleBookingStatusCallback(callback_query);
-  return;
-}
-
-// Cancel: restore the original buttons
-if (data.startsWith("back:")) {
-  const bookingId = data.replace("back:", "").trim();
-  if (!UUID_RE.test(bookingId)) {
-    await answerCallbackQuery(callbackId, "Invalid action.");
-    return;
-  }
-  await answerCallbackQuery(callbackId);
-  await editTelegramReplyMarkup(chatId, messageId, {
-    inline_keyboard: [
-      [
-        { text: "✅ Accept", callback_data: `accept:${bookingId}` },
-        { text: "❌ Decline", callback_data: `decline:${bookingId}` },
-      ],
-    ],
-  });
-  return;
-}
 
     // --- Action: Merchant confirms account connection (sess_ or pg_) ---
     if (data.startsWith("confirm_tg:")) {
