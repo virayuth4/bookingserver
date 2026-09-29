@@ -1055,7 +1055,7 @@ router.post('/booking/create', async (req, res) => {
     // Notify the venue BEFORE committing — roll back if the venue never got it.
     let telegramMessageId = null;
     try {
-      const tgRes = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      const tgRes = await fetch(`https://api.telegram.org/bot${process.env.MERCHANT_TELEGRAM_BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -12,9 +12,19 @@ const randomHex = crypto.randomBytes(8).toString("hex");
 const { getPageForMerchant } = require("../../../lib/getPageForMerchant");
 const { UUID_RE } = require("../../../lib/uuidRe");
 const { escapeHtml, formatBookingDate, formatBookingTime } = require("../../../lib/formats");
+const DEBUG = process.env.TELEGRAM_DEBUG === "1" || process.env.NODE_ENV !== "production";
+const dbg = (...args) => { if (DEBUG) console.log("[tg-debug]", ...args); };
 
-const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
-const CUSTOMER_TELEGRAM_API = `https://api.telegram.org/bot${process.env.ACME_RESERVE_CUSTOMER_BOT_TOKEN}`;
+const MERCHANT_BOT_TOKEN = process.env.MERCHANT_TELEGRAM_BOT_TOKEN;
+const MERCHANT_BOT_USERNAME = process.env.MERCHANT_TELEGRAM_BOT_USERNAME;
+const CUSTOMER_BOT_TOKEN = process.env.ACME_RESERVE_CUSTOMER_BOT_TOKEN;
+
+const TELEGRAM_API = `https://api.telegram.org/bot${MERCHANT_BOT_TOKEN}`;
+const CUSTOMER_TELEGRAM_API = `https://api.telegram.org/bot${CUSTOMER_BOT_TOKEN}`;
+
+
+
+
 
 // =============================================================================
 // Booking status state machine
@@ -439,8 +449,9 @@ router.post('/booking-settings/telegram-session', authenticateFirebaseToken, asy
       [token, merchantId]
     );
 
-    const botUsername = process.env.TELEGRAM_BOT_USERNAME;
+    const botUsername = process.env.MERCHANT_TELEGRAM_BOT_USERNAME;
     const deepLink = `https://t.me/${botUsername}?start=${token}`;
+    console.log("[tg-debug] deepLink:", deepLink, "| username:", MERCHANT_BOT_USERNAME);
 
     return res.status(200).json({ token, deepLink });
   } catch (error) {
@@ -497,7 +508,7 @@ router.post('/booking-settings/:id/telegram-link', authenticateFirebaseToken, as
       [token, pageId]
     );
 
-    const botUsername = process.env.TELEGRAM_BOT_USERNAME; // e.g. "EatDokoBot" (without @)
+    const botUsername = process.env.MERCHANT_TELEGRAM_BOT_USERNAME; 
     const deepLink = `https://t.me/${botUsername}?start=${token}`;
 
     return res.status(200).json({ deepLink });
@@ -513,8 +524,8 @@ router.post("/telegram-webhook", async (req, res) => {
   res.sendStatus(200);
 
   const { message, callback_query } = req.body || {};
-  const dashboardUrl = "https://eatdoko.com";
-  const botUsername = process.env.TELEGRAM_BOT_USERNAME;
+  const dashboardUrl = "https://acmereserve.com";
+  const botUsername = process.env.MERHCHANT_TELEGRAM__BOT_USERNAME;
 
   // =========================================================================
   // 1. User clicked a deep link and launched /start <token> (or /start@Bot <token>
@@ -643,6 +654,7 @@ router.post("/telegram-webhook", async (req, res) => {
           }
 
           const groupDeepLink = `https://t.me/${botUsername}?startgroup=${rawToken}`;
+          console.log("Group DeepLink", groupDeepLink)
           const keyboard = {
             inline_keyboard: [
               [{ text: `✅ Connect as ${username}`, callback_data: `confirm_tg:${rawToken}` }],
