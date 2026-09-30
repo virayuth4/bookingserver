@@ -98,21 +98,63 @@ function stripFooter(text) {
   return text.split(FOOTER_SEP)[0];
 }
 
+function formatServiceName(booking) {
+  const raw = booking.service_name || booking.service_type_id;
+  if (!raw) return null;
+  return String(raw).replace(/[_-]+/g, " ").replace(/^\w/, (c) => c.toUpperCase());
+}
+
+function resolveServiceLabel(page, booking) {
+  const sections = Array.isArray(page?.sections) ? page.sections : [];
+  const serviceTypes = Array.isArray(page?.service_types) ? page.service_types : [];
+
+  const sectionMatch = sections.find((s) =>
+    typeof s === "string" ? s === booking.section_id : s.id === booking.section_id
+  );
+  const sectionName = typeof sectionMatch === "string" ? sectionMatch : sectionMatch?.name ?? "";
+
+  const serviceMatch = serviceTypes.find((s) =>
+    typeof s === "string"
+      ? s.toLowerCase().replace(/\s+/g, "-") === booking.service_type_id || s === booking.service_type_id
+      : s.id === booking.service_type_id
+  );
+  const serviceName = typeof serviceMatch === "string" ? serviceMatch : serviceMatch?.name ?? "";
+
+  return [sectionName, serviceName].filter(Boolean).join(" · ");
+}
+
+function buildMerchantBookingText(booking, header, { requestedAt } = {}) {
+  // Prefer the resolved label; fall back to prettifying service_type_id
+  const service = booking.service_label || formatServiceName(booking);
+
+  const lines = [
+    `<b>${escapeHtml(header)}</b>`,
+    requestedAt ? `🕒 Requested on: ${escapeHtml(requestedAt)}` : null,
+    "",
+    booking.full_name ? `🙋 Name: ${escapeHtml(booking.full_name)}` : null,
+    booking.booking_date ? `📅 Date: ${escapeHtml(formatBookingDate(booking.booking_date))}` : null,
+    booking.start_time ? `⏰ Time: ${escapeHtml(formatBookingTime(booking.start_time))}` : null,
+    service ? `🍽 Service: ${escapeHtml(service)}` : null,
+    booking.guests ? `👥 Party size: ${escapeHtml(String(booking.guests))}` : null,
+    booking.note ? `📝 Notes: ${escapeHtml(booking.note)}` : null,
+    booking.phone ? `📞 Contact: ${escapeHtml(booking.phone)}` : null,
+  ];
+
+  return lines.filter((l) => l !== null).join("\n");
+}
 // Builds the full edited message text (already HTML-escaped, since
 // callbackQuery.message.text is plain text and we send with parse_mode HTML).
 function buildUpdatedMessage(originalText, status, responderName, booking) {
   const meta = STATUS_META[status];
-  const base = replaceBookingHeader(stripFooter(originalText || ""), status);
-  const statusLine = `${meta.verb} by ${responderName || "someone"}`;
 
-  // Phone numbers in plain Telegram message text are auto-linkified on
-  // mobile — tapping one offers Call / Message / Copy, so no button
-  // (and no tel:/sms: URL scheme, which inline keyboards don't support) needed.
-  const contactLine = booking?.phone
-    ? `\nCustomer: ${booking.full_name}: ${booking.phone}`
-    : "";
+  // Keep the header language (Khmer vs English) of the original message
+  const firstLine = (originalText || "").split("\n")[0] || "";
+  const header = /[\u1780-\u17FF]/.test(firstLine) ? meta.km : meta.en;
 
-  return escapeHtml(`${base}${FOOTER_SEP}\n${statusLine}${contactLine}`);
+  const body = buildMerchantBookingText(booking, header);
+  const statusLine = `👤 ${escapeHtml(meta.verb)} by ${escapeHtml(responderName || "someone")}`;
+
+  return `${body}${FOOTER_SEP}\n${statusLine}`;
 }
 
 // Message sent to the customer's own chat. Returns null when we stay silent.
@@ -451,7 +493,7 @@ router.post('/booking-settings/telegram-session', authenticateFirebaseToken, asy
 
     const botUsername = process.env.MERCHANT_TELEGRAM_BOT_USERNAME;
     const deepLink = `https://t.me/${botUsername}?start=${token}`;
-    console.log("[tg-debug] deepLink:", deepLink, "| username:", MERCHANT_BOT_USERNAME);
+    // console.log("[tg-debug] deepLink:", deepLink, "| username:", botUsername);
 
     return res.status(200).json({ token, deepLink });
   } catch (error) {
@@ -520,6 +562,11 @@ router.post('/booking-settings/:id/telegram-link', authenticateFirebaseToken, as
 
 // POST /api/telegram-webhook
 router.post("/telegram-webhook", async (req, res) => {
+   const expected = process.env.MERCHANT_TELEGRAM_WEBHOOK_SERCRET;
+  if (expected && req.get("X-Telegram-Bot-Api-Secret-Token") !== expected) {
+    console.warn("[tg-debug] webhook rejected: bad secret token");
+    return res.sendStatus(403);
+  }
   // Always return 200 OK immediately so Telegram doesn't retry delivery
   res.sendStatus(200);
 
@@ -911,3 +958,7 @@ router.post('/booking-settings/:id/telegram-disconnect', authenticateFirebaseTok
 
 
 module.exports = router;
+
+module.exports.resolveServiceLabel = resolveServiceLabel;
+module.exports.buildMerchantBookingText = buildMerchantBookingText;
+module.exports.PENDING_KEYBOARD = PENDING_KEYBOARD;

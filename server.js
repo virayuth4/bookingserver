@@ -6,13 +6,14 @@ const config = require('./config/config')
 const { testS3Connection } = require('./database/s3');
 const cron = require('node-cron');
 const axios = require("axios");
+const {startJobs} = require('./jobs/index.js')
 
 
 require('dotenv').config();
 
 
 
-const initializeDatabases = require('./database/pgInit')
+const initializeDatabases = require('./database/pgInit');
 
 
 process.on("unhandledRejection", (err) => {
@@ -143,6 +144,7 @@ async function startServer() {
     console.log(`Server is running on port: ${PORT}`);
     console.log(`Environment: ${process.env.NODE_ENV}`);
     console.log("Client:", process.env.NEXT_PUBLIC_BACKEND);
+    startJobs();
 
   
   });

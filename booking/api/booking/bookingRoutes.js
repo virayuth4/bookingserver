@@ -12,6 +12,7 @@ const { getPageForMerchant } = require("../../../lib/getPageForMerchant");
 const { UUID_RE } = require("../../../lib/uuidRe");
 const { formatRequestedAt, formatBookingDate, formatBookingTime } = require("../../../lib/formats");
 const { getVerifiedTelegramUser, verifyInitData, sendCustomerReceipt } = require("../../../lib/verifyInitData");
+const { buildMerchantBookingText, PENDING_KEYBOARD, resolveServiceLabel } = require("../telegram/telegramRoutes");
 
 // ---------------------------------------------------------------------------
 // Booking page settings
@@ -973,42 +974,43 @@ router.get('/booking-settings/:id/blocked-slots', authenticateFirebaseToken, asy
   res.status(200).json({ blockedSlots: result.rows });
 });
 
+
 router.post('/booking/create', async (req, res) => {
   const {
     pageId, anonId, sectionId, serviceTypeId, guests, date, time, fullName, contact, note,
-    telegramInitData, 
+    telegramInitData,
   } = req.body;
-  const telegramWriteAccess = true; 
-  console.log("Req body in creatng booking", req.body)
-  console.log("telegramWriteAccess", telegramWriteAccess)
- 
+  const telegramWriteAccess = true;
+  console.log("Req body in creatng booking", req.body);
+  console.log("telegramWriteAccess", telegramWriteAccess);
+
   if (!pageId || !guests || !date || !time || !fullName || !contact) {
     return res.status(400).json({ error: 'Missing required fields.' });
   }
- 
+
   // Only set when the request carries a valid, signed Telegram Mini App payload.
   const tgUser = getVerifiedTelegramUser(telegramInitData);
   const customerChatId = tgUser?.id ? String(tgUser.id) : null;
- 
+
   const client = await zingoPool.connect();
   let inTransaction = false;
- 
+
   try {
     const pageResult = await client.query(`SELECT * FROM booking_pages WHERE id = $1 LIMIT 1`, [pageId]);
     const page = pageResult.rows[0];
- 
+
     if (!page || !page.is_active) {
       return res.status(400).json({ error: 'This page is not accepting bookings.' });
     }
- 
+
     // No chat connected = nobody would ever see the request.
     if (!page.telegram_chat_id) {
       return res.status(409).json({ error: 'This venue has not connected Telegram yet.' });
     }
- 
+
     await client.query('BEGIN');
     inTransaction = true;
- 
+
     const bookingResult = await client.query(
       `INSERT INTO bookings
          (booking_page_id, section_id, service_type_id, guests, booking_date, start_time,
@@ -1029,29 +1031,19 @@ router.post('/booking/create', async (req, res) => {
       ]
     );
     const booking = bookingResult.rows[0];
- 
+
     await client.query(
       `INSERT INTO booking_events (booking_id, type, payload, actor) VALUES ($1,$2,$3,$4);`,
       [booking.id, 'created', JSON.stringify(booking), 'customer']
     );
- 
-    const sections = Array.isArray(page.sections) ? page.sections : [];
-    const serviceTypes = Array.isArray(page.service_types) ? page.service_types : [];
-    const sectionMatch = sections.find((s) => (typeof s === 'string' ? s === booking.section_id : s.id === booking.section_id));
-    const sectionName = typeof sectionMatch === 'string' ? sectionMatch : sectionMatch?.name ?? '';
-    const serviceMatch = serviceTypes.find((s) => (typeof s === 'string' ? s.toLowerCase().replace(/\s+/g, '-') === booking.service_type_id || s === booking.service_type_id : s.id === booking.service_type_id));
-    const serviceName = typeof serviceMatch === 'string' ? serviceMatch : serviceMatch?.name ?? '';
- 
-    const text =
-      `📅 New booking request\n` +
-      `Requested on: ${formatRequestedAt()}\n` +
-      `――――――――――――――――\n\n` +
-      `Name: ${booking.full_name} — ${booking.guests} guest(s)\n` +
-      `Date & Time: ${formatBookingDate(booking.booking_date)} at ${formatBookingTime(booking.start_time)}\n` +
-      (sectionName || serviceName ? `Service: ${[sectionName, serviceName].filter(Boolean).join(' · ')}\n` : '') +
-      `Contact: ${booking.phone}` +
-      (booking.note ? `\nNote: ${booking.note}` : '');
- 
+
+    // Set after the event insert so it isn't stored in the payload
+    booking.service_label = resolveServiceLabel(page, booking);
+
+    const text = buildMerchantBookingText(booking, "🔔 New booking request", {
+      requestedAt: formatRequestedAt(),
+    });
+
     // Notify the venue BEFORE committing — roll back if the venue never got it.
     let telegramMessageId = null;
     try {
@@ -1061,14 +1053,12 @@ router.post('/booking/create', async (req, res) => {
         body: JSON.stringify({
           chat_id: page.telegram_chat_id,
           text,
-          reply_markup: { inline_keyboard: [[
-            { text: '✅ Accept', callback_data: `accept:${booking.id}` },
-            { text: '❌ Decline', callback_data: `decline:${booking.id}` },
-          ]] },
+          parse_mode: 'HTML',
+          reply_markup: PENDING_KEYBOARD(booking.id),
         }),
       });
       const tgData = await tgRes.json().catch(() => null);
- 
+
       if (!tgRes.ok || !tgData?.ok) {
         console.error('Telegram notification rejected:', tgData);
         throw new Error('telegram_send_failed');
@@ -1080,18 +1070,19 @@ router.post('/booking/create', async (req, res) => {
       inTransaction = false;
       return res.status(502).json({ error: "Couldn't reach the venue right now. Please try again." });
     }
- 
+
     if (telegramMessageId) {
       await client.query(`UPDATE bookings SET telegram_message_id = $1 WHERE id = $2`, [telegramMessageId, booking.id]);
       booking.telegram_message_id = telegramMessageId;
     }
- 
+
     await client.query('COMMIT');
     inTransaction = false;
     let notified = false;
+
     // Booking is safely stored. Now send the customer their receipt (best effort).
     if (customerChatId && telegramWriteAccess) {
-     notified = await sendCustomerReceipt(
+      notified = await sendCustomerReceipt(
         customerChatId,
         `📩 Booking request received\n` +
           `⏳ Status: Pending confirmation\n` +
@@ -1103,11 +1094,11 @@ router.post('/booking/create', async (req, res) => {
           `The venue hasn't confirmed yet. We'll message you here as soon as they accept or decline.`
       );
       await zingoPool.query(
-    `UPDATE bookings SET telegram_notify_ok = $1 WHERE id = $2`,
-    [notified, booking.id]
-  );
+        `UPDATE bookings SET telegram_notify_ok = $1 WHERE id = $2`,
+        [notified, booking.id]
+      );
     }
- 
+
     return res.status(201).json({ booking, notifications: notified });
   } catch (err) {
     if (inTransaction) await client.query('ROLLBACK').catch(() => {});
