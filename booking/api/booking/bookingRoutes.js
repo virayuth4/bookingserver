@@ -14,6 +14,107 @@ const { formatRequestedAt, formatBookingDate, formatBookingTime } = require("../
 const { getVerifiedTelegramUser, verifyInitData, sendCustomerReceipt } = require("../../../lib/verifyInitData");
 const { buildMerchantBookingText, PENDING_KEYBOARD, resolveServiceLabel } = require("../telegram/telegramRoutes");
 
+
+const DEBUG_BOOKING = process.env.DEBUG_BOOKING !== 'false'; // set DEBUG_BOOKING=false in DO when done
+
+function dbg(reqId, label, data) {
+  if (!DEBUG_BOOKING) return;
+  if (data === undefined) console.log(`[booking:${reqId}] ${label}`);
+  else console.log(`[booking:${reqId}] ${label}`, data);
+}
+
+function mask(v, keep = 2) {
+  if (v === null || v === undefined || v === '') return v;
+  const s = String(v);
+  return `${s.slice(0, keep)}***(${s.length})`;
+}
+
+// Describes a bot token without revealing it. The bot id (digits before ":") is public info.
+function describeToken(raw) {
+  const t = raw ?? '';
+  return {
+    loaded: Boolean(t),
+    length: t.length,
+    botId: t.split(':')[0] || null,
+    hasWhitespace: t !== t.trim(),
+    hasQuotes: /^["']|["']$/.test(t),
+    formatOk: /^\d{6,}:[A-Za-z0-9_-]{30,}$/.test(t.trim()),
+  };
+}
+
+// Calls the Telegram Bot API and never throws. Returns { httpStatus, data, networkError, ms }.
+async function telegramCall(token, method, body) {
+  const t0 = Date.now();
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await res.json().catch(() => null);
+    return { httpStatus: res.status, data, networkError: null, ms: Date.now() - t0 };
+  } catch (err) {
+    return {
+      httpStatus: null,
+      data: null,
+      networkError: { name: err.name, message: err.message, cause: err.cause?.code || err.cause?.message },
+      ms: Date.now() - t0,
+    };
+  }
+}
+
+// Run this AFTER a failed sendMessage to find out which layer is broken.
+async function diagnoseTelegramFailure(reqId, token, chatId, failure) {
+  console.error(`[booking:${reqId}] sendMessage FAILED`, failure);
+
+  // 1. Is the token valid at all?
+  const me = await telegramCall(token, 'getMe');
+  if (me.networkError || !me.data?.ok) {
+    console.error(`[booking:${reqId}] DIAGNOSIS: TOKEN problem. getMe failed`, {
+      httpStatus: me.httpStatus,
+      data: me.data,
+      networkError: me.networkError,
+      token: describeToken(token),
+    });
+    return {
+      stage: 'token',
+      detail: me.data?.description || me.networkError?.message || 'getMe failed',
+    };
+  }
+  console.error(`[booking:${reqId}] token is VALID for bot`, {
+    id: me.data.result.id,
+    username: me.data.result.username,
+  });
+
+  // 2. Can this bot see the venue's chat?
+  const chat = await telegramCall(token, 'getChat', { chat_id: chatId });
+  if (!chat.data?.ok) {
+    console.error(`[booking:${reqId}] DIAGNOSIS: CHAT problem. Bot @${me.data.result.username} cannot access chat ${mask(chatId, 3)}`, {
+      httpStatus: chat.httpStatus,
+      data: chat.data,
+    });
+    return { stage: 'chat', detail: chat.data?.description || 'getChat failed' };
+  }
+  console.error(`[booking:${reqId}] chat is reachable`, { type: chat.data.result.type });
+
+  // 3. Token and chat are fine, so the message itself was rejected (HTML parse error, bad keyboard, etc.)
+  console.error(`[booking:${reqId}] DIAGNOSIS: MESSAGE problem. Check the text for unescaped < > & and the reply_markup`);
+  return { stage: 'message', detail: failure?.data?.description || 'sendMessage rejected' };
+}
+
+// Call once at server start (inside app.listen callback) so you see the token state in the deploy logs.
+async function logMerchantTokenAtStartup() {
+  const token = (process.env.MERCHANT_TELEGRAM_BOT_TOKEN || '').trim();
+  console.log('[startup] merchant token', describeToken(process.env.MERCHANT_TELEGRAM_BOT_TOKEN));
+  if (!token) return;
+  const me = await telegramCall(token, 'getMe');
+  console.log('[startup] merchant getMe', me.data?.ok
+    ? { ok: true, botId: me.data.result.id, username: me.data.result.username }
+    : { ok: false, httpStatus: me.httpStatus, data: me.data, networkError: me.networkError });
+}
+
+
 // ---------------------------------------------------------------------------
 // Booking page settings
 // ---------------------------------------------------------------------------
