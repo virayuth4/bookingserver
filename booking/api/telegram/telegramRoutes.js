@@ -562,17 +562,17 @@ router.post('/booking-settings/:id/telegram-link', authenticateFirebaseToken, as
 
 // POST /api/telegram-webhook
 router.post("/telegram-webhook", async (req, res) => {
-  //  const expected = process.env.MERCHANT_TELEGRAM_WEBHOOK_SERCRET;
-  // if (expected && req.get("X-Telegram-Bot-Api-Secret-Token") !== expected) {
-  //   console.warn("[tg-debug] webhook rejected: bad secret token");
-  //   return res.sendStatus(403);
-  // }
+   const expected = process.env.MERCHANT_TELEGRAM_WEBHOOK_SERCRET;
+  if (expected && req.get("X-Telegram-Bot-Api-Secret-Token") !== expected) {
+    console.warn("[tg-debug] webhook rejected: bad secret token");
+    return res.sendStatus(403);
+  }
   // Always return 200 OK immediately so Telegram doesn't retry delivery
   res.sendStatus(200);
 
   const { message, callback_query } = req.body || {};
   const dashboardUrl = "https://acmereserve.com";
-  const botUsername = process.env.MERHCHANT_TELEGRAM__BOT_USERNAME;
+  const botUsername = process.env.MERHCHANT_TELEGRAM_BOT_USERNAME;
 
   // =========================================================================
   // 1. User clicked a deep link and launched /start <token> (or /start@Bot <token>
