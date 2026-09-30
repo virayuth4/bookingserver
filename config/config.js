@@ -37,6 +37,7 @@ const defaultOrigins = [
         'https://king-prawn-app-rrla3.ondigitalocean.app',
         'https://acmereserve.com',
         'https://www.acmereserve.com',
+        'https://www.acmereserve.com/tg',
         'https://afterglow-monsieur-quarterly.ngrok-free.dev',
         'https://afterglow-monsieur-quarterly.ngrok-free.app',
         'https://afterglow-monsieur-quarterly.ngrok-free.dev/tg'
