@@ -562,11 +562,11 @@ router.post('/booking-settings/:id/telegram-link', authenticateFirebaseToken, as
 
 // POST /api/telegram-webhook
 router.post("/telegram-webhook", async (req, res) => {
-   const expected = process.env.MERCHANT_TELEGRAM_WEBHOOK_SERCRET;
-  if (expected && req.get("X-Telegram-Bot-Api-Secret-Token") !== expected) {
-    console.warn("[tg-debug] webhook rejected: bad secret token");
-    return res.sendStatus(403);
-  }
+  //  const expected = process.env.MERCHANT_TELEGRAM_WEBHOOK_SERCRET;
+  // if (expected && req.get("X-Telegram-Bot-Api-Secret-Token") !== expected) {
+  //   console.warn("[tg-debug] webhook rejected: bad secret token");
+  //   return res.sendStatus(403);
+  // }
   // Always return 200 OK immediately so Telegram doesn't retry delivery
   res.sendStatus(200);
 
