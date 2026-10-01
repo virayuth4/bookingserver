@@ -118,16 +118,16 @@ async function logMerchantTokenAtStartup() {
 
 
 
-function tokenFingerprint(raw) {
-  const t = (raw || '').trim();
-  return {
-    botId: t.split(':')[0],
-    sha256: crypto.createHash('sha256').update(t).digest('hex').slice(0, 8),
-    last4: t.slice(-4),
-  };
-}
+// function tokenFingerprint(raw) {
+//   const t = (raw || '').trim();
+//   return {
+//     botId: t.split(':')[0],
+//     sha256: crypto.createHash('sha256').update(t).digest('hex').slice(0, 8),
+//     last4: t.slice(-4),
+//   };
+// }
 
-console.log('[startup] merchant token fingerprint', tokenFingerprint(process.env.MERCHANT_TELEGRAM_BOT_TOKEN));
+// console.log('[startup] merchant token fingerprint', tokenFingerprint(process.env.MERCHANT_TELEGRAM_BOT_TOKEN));
 
 // ---------------------------------------------------------------------------
 // Booking page settings
