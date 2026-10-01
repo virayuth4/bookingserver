@@ -13,7 +13,6 @@ require('dotenv').config();
 
 
 
-const initializeDatabases = require('./database/pgInit');
 
 
 process.on("unhandledRejection", (err) => {
@@ -90,6 +89,7 @@ app.use('/api/booking-link', require('./booking/api/user/userRoutes.js'))
 app.use('/api/booking-link', require('./booking/api/booking/bookingRoutes.js'))
 app.use('/api/booking-link', require('./booking/api/booking/slugRoutes.js'))
 app.use('/api/booking-link', require('./booking/api/telegram/telegramRoutes.js'))
+app.use('/api/booking-link', require('./booking/api/telegram/telegramOTP.js'))
 
 
 // For view tracking
@@ -136,7 +136,6 @@ async function startServer() {
     console.error("S3 bucket configuration failed");
   }
 
-  initializeDatabases().catch(console.error);
 
   
 

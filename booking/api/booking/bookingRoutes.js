@@ -14,6 +14,7 @@ const { formatRequestedAt, formatBookingDate, formatBookingTime } = require("../
 const { getVerifiedTelegramUser, verifyInitData, sendCustomerReceipt } = require("../../../lib/verifyInitData");
 const { buildMerchantBookingText, PENDING_KEYBOARD, resolveServiceLabel } = require("../telegram/telegramRoutes");
 const { buildBookingKeyboard } = require("../../../lib/bookingKeyboard");
+const { parseTelegramInput } = require("../../../lib/parsers");
 
 
 const DEBUG_BOOKING = process.env.DEBUG_BOOKING !== 'false'; // set DEBUG_BOOKING=false in DO when done
@@ -227,20 +228,6 @@ function parsePhoneInput(phone) {
   return { value };
 }
 
-function parseTelegramInput(telegram) {
-  const value = (telegram || '').trim();
-  if (!value) return { value: null };
-  let url;
-  try {
-    url = new URL(value);
-  } catch {
-    return { error: 'Telegram must be a valid URL (e.g. https://t.me/username).' };
-  }
-  if (!['http:', 'https:'].includes(url.protocol)) {
-    return { error: 'Telegram must be a valid http(s) URL.' };
-  }
-  return { value };
-}
 
 // Parses the telegram_chat_id sent from the "Verify & Connect Telegram" flow.
 // Telegram chat IDs are integers (can be negative for groups/channels), so we

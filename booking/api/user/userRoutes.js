@@ -5,7 +5,7 @@ const authenticateFirebaseToken = require("../../../auth/authFirebaseToken");
 const zingoPool = require("../../../database/pgZingo");
 const { admin, auth } = require("../../../auth/firebase-admin");
 const { normalizePhoneNumber, toFirebaseEmail } = require("../../../lib/normalizePhoneNumber");
-
+const crypto = require('crypto');
 
 
 const TELEGRAM_GATEWAY_URL = 'https://gatewayapi.telegram.org/sendVerificationMessage';
@@ -17,71 +17,74 @@ function toE164(phoneNumber) {
     return `+${digits}`;
 }
 
-async function sendOTPWithTelegramGateway(phoneNumber, otp, fullName, requestNumber = 1, ttlSeconds = 60) {
-    console.log(`[Telegram Gateway] Sending OTP to ${phoneNumber} | Attempt: ${requestNumber}`);
 
-    const token = process.env.TELEGRAM_GATEWAY_TOKEN; // server-only secret
-    if (!token) {
-        console.error('❌ TELEGRAM_GATEWAY_TOKEN is undefined!');
-        return { success: false, error: 'Configuration Error: Missing Telegram Gateway token' };
-    }
+// Function to send Telegram OTP via Telegram Gateway API. Returns { success: boolean, message?: string, error?: string, details?: any }.
+// NO longer in used because I don't want to pay 100$ in deposit to Telegram Gateway just to send OTPs. 
+// async function sendOTPWithTelegramGateway(phoneNumber, otp, fullName, requestNumber = 1, ttlSeconds = 60) {
+//     console.log(`[Telegram Gateway] Sending OTP to ${phoneNumber} | Attempt: ${requestNumber}`);
 
-    // Gateway only accepts numeric codes of 4-8 digits
-    if (!/^\d{4,8}$/.test(String(otp))) {
-        return { success: false, error: 'Invalid OTP format: must be 4-8 digits' };
-    }
+//     const token = process.env.TELEGRAM_GATEWAY_TOKEN; // server-only secret
+//     if (!token) {
+//         console.error('❌ TELEGRAM_GATEWAY_TOKEN is undefined!');
+//         return { success: false, error: 'Configuration Error: Missing Telegram Gateway token' };
+//     }
 
-    // ttl must be within 30-3600s; if undelivered in that window, Telegram refunds the fee
-    const ttl = Math.min(3600, Math.max(30, Math.floor(ttlSeconds)));
+//     // Gateway only accepts numeric codes of 4-8 digits
+//     if (!/^\d{4,8}$/.test(String(otp))) {
+//         return { success: false, error: 'Invalid OTP format: must be 4-8 digits' };
+//     }
 
-    try {
-        const response = await axios.post(
-            TELEGRAM_GATEWAY_URL,
-            {
-                phone_number: toE164(phoneNumber),
-                code: String(otp),
-                ttl,
-                payload: `otp:${requestNumber}`, // internal use only, not shown to the user
-            },
-            {
-                timeout: 8000,
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${token}`,
-                },
-            }
-        );
+//     // ttl must be within 30-3600s; if undelivered in that window, Telegram refunds the fee
+//     const ttl = Math.min(3600, Math.max(30, Math.floor(ttlSeconds)));
 
-        const body = response.data;
+//     try {
+//         const response = await axios.post(
+//             TELEGRAM_GATEWAY_URL,
+//             {
+//                 phone_number: toE164(phoneNumber),
+//                 code: String(otp),
+//                 ttl,
+//                 payload: `otp:${requestNumber}`, // internal use only, not shown to the user
+//             },
+//             {
+//                 timeout: 8000,
+//                 headers: {
+//                     'Content-Type': 'application/json',
+//                     Authorization: `Bearer ${token}`,
+//                 },
+//             }
+//         );
 
-        if (body?.ok) {
-            console.log('✅ [Telegram Gateway] Sent. request_id:', body.result?.request_id);
-            return {
-                success: true,
-                message: 'OTP sent via Telegram',
-                data: {
-                    requestId: body.result?.request_id,
-                    cost: body.result?.request_cost,
-                    remainingBalance: body.result?.remaining_balance,
-                },
-            };
-        }
+//         const body = response.data;
 
-        console.warn('⚠️ [Telegram Gateway] ok=false:', body);
-        return { success: false, error: 'Telegram Gateway rejected the request', details: body?.error };
-    } catch (error) {
-        // Gateway returns { ok: false, error: "SOME_CODE" } on failures
-        const details = error.response?.data?.error || error.response?.data || error.message;
+//         if (body?.ok) {
+//             console.log('✅ [Telegram Gateway] Sent. request_id:', body.result?.request_id);
+//             return {
+//                 success: true,
+//                 message: 'OTP sent via Telegram',
+//                 data: {
+//                     requestId: body.result?.request_id,
+//                     cost: body.result?.request_cost,
+//                     remainingBalance: body.result?.remaining_balance,
+//                 },
+//             };
+//         }
 
-        if (error.code === 'ECONNABORTED') {
-            console.error('❌ [Telegram Gateway] Request timed out');
-        } else {
-            console.error('❌ [Telegram Gateway] Failed:', details);
-        }
+//         console.warn('⚠️ [Telegram Gateway] ok=false:', body);
+//         return { success: false, error: 'Telegram Gateway rejected the request', details: body?.error };
+//     } catch (error) {
+//         // Gateway returns { ok: false, error: "SOME_CODE" } on failures
+//         const details = error.response?.data?.error || error.response?.data || error.message;
 
-        return { success: false, error: 'Failed to send OTP via Telegram', details };
-    }
-}
+//         if (error.code === 'ECONNABORTED') {
+//             console.error('❌ [Telegram Gateway] Request timed out');
+//         } else {
+//             console.error('❌ [Telegram Gateway] Failed:', details);
+//         }
+
+//         return { success: false, error: 'Failed to send OTP via Telegram', details };
+//     }
+// }
 
 async function sendOTPWithServiceAPI(phoneNumber, otp, fullName, requestNumber = 1) {
     console.log("\n--- [START] Sending OTP via External Service ---");
@@ -342,17 +345,17 @@ router.post("/user/registration/initiate", async (req, res) => {
         console.log("Query Result:", result.rows[0]);
 
         // const otpResult = await sendOTPWithServiceAPI(phoneNumber, otp, fullName);
-        const otpResult = await sendOTPWithTelegramGateway(phoneNumber, otp, fullName, 1, 60);
+        // const otpResult = await sendOTPWithTelegramGateway(phoneNumber, otp, fullName, 1, 60);
 
 
-            if (!otpResult.success) {
-                console.error("OTP Delivery failed, notifying client...");
-                return res.status(502).json({
-                    success: false,
-                    error: "Failed to deliver SMS OTP. Please try again.",
-                    details: otpResult.details
-                });
-            }
+            // if (!otpResult.success) {
+            //     console.error("OTP Delivery failed, notifying client...");
+            //     return res.status(502).json({
+            //         success: false,
+            //         error: "Failed to deliver SMS OTP. Please try again.",
+            //         details: otpResult.details
+            //     });
+            // }
 
         return res.json({ success: true, message: 'OTP sent successfully' });
 
@@ -537,100 +540,124 @@ router.post('/create-user-profile', async (req, res) => {
     res.status(500).json({ error: 'Failed to process user profile' });
   }
 });
+
 router.post("/user/forgot-password/initiate", async (req, res) => {
     console.log("==========Initiate Forgot Password ==========");
-    let { phoneNumber } = req.body; // no password here — nothing sensitive yet
-
-    phoneNumber = normalizePhoneNumber(phoneNumber);
-
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-
-    const query = `
-        INSERT INTO booking_otp ("phone_number", "otp_code")
-        VALUES ($1, $2)
-        ON CONFLICT ("phone_number")
-        DO UPDATE SET
-            "otp_code" = EXCLUDED."otp_code",
-            "attempts" = 0,
-            "created_at" = CURRENT_TIMESTAMP,
-            "expires_at" = CURRENT_TIMESTAMP + INTERVAL '10 minutes'
-        RETURNING *;
-    `;
 
     try {
-        const result = await zingoPool.query(query, [phoneNumber, otp]);
-        console.log("Query Result:", result.rows[0]);
-        await sendOTPWithServiceAPI(phoneNumber, otp);
-        return res.json({ success: true, message: 'OTP sent successfully' });
+        const phoneNumber = normalizePhoneNumber(req.body?.phoneNumber);
+        const phoneEmail = toFirebaseEmail(phoneNumber);
+      console.log("phoneNumber:", phoneNumber, "phoneEmail:", phoneEmail);
+
+        // Only existing accounts can reset
+        try {
+            await auth.getUserByEmail(phoneEmail);
+        } catch (error) {
+            if (error.code === 'auth/user-not-found') {
+                return res.status(404).json({
+                    success: false,
+                    message: 'No account found for this phone number'
+                });
+            }
+            throw error;
+        }
+ 
+        // Placeholder only. Nobody has seen it: the real OTP is generated by the bot
+        // after Telegram proves the phone number.
+        const placeholder = crypto.randomInt(100000, 1000000).toString();
+ 
+        await zingoPool.query(
+            `INSERT INTO booking_otp ("phone_number", "otp_code")
+             VALUES ($1, $2)
+             ON CONFLICT ("phone_number")
+             DO UPDATE SET
+                "otp_code" = EXCLUDED."otp_code",
+                "attempts" = 0,
+                "user_info" = NULL,
+                "created_at" = CURRENT_TIMESTAMP,
+                "expires_at" = CURRENT_TIMESTAMP + INTERVAL '10 minutes',
+                "tg_status" = 'pending',
+                "tg_nonce" = NULL,
+                "tg_chat_id" = NULL,
+                "tg_user_id" = NULL`,
+            [phoneNumber, placeholder]
+        );
+ 
+        return res.json({ success: true, message: 'Continue with Telegram' });
     } catch (error) {
-        console.error("Error executing query:", error);
-        return res.status(500).json({ success: false, error: error.message });
+        console.error("Error in forgot-password initiate:", error);
+        return res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
-
+ 
+/* ---------------------------------------------------------------
+ * Step 2: verify the code AND reset the password in one request.
+ * newPassword only ever exists in this request, never in the DB.
+ * ------------------------------------------------------------- */
 router.post("/user/forgot-password/otp-confirmation", async (req, res) => {
     console.log("=====Forgot Password OTP-Confirmation==========");
     const { phoneNumber, otpCode, newPassword } = req.body;
-
+    console.log("phoneNumber:", phoneNumber, "otpCode:", otpCode, "newPassword length:", newPassword?.length);
+ 
     if (!newPassword || newPassword.length < 8) {
         return res.status(400).json({ success: false, message: "Password must be at least 8 characters." });
     }
-
+ 
     const formattedPhoneNumber = normalizePhoneNumber(phoneNumber);
-
+ 
     try {
-        const getOtpQuery = `
-            SELECT "otp_code", attempts,
-                EXTRACT(EPOCH FROM ("expires_at" - NOW())) as seconds_remaining
-            FROM booking_otp
-            WHERE "phone_number" = $1
-        `;
-        const otpResult = await zingoPool.query(getOtpQuery, [formattedPhoneNumber]);
-
+        const otpResult = await zingoPool.query(
+            `SELECT "otp_code", attempts, tg_status,
+                    EXTRACT(EPOCH FROM ("expires_at" - NOW())) AS seconds_remaining
+               FROM booking_otp
+              WHERE "phone_number" = $1`,
+            [formattedPhoneNumber]
+        );
+ 
         if (otpResult.rows.length === 0) {
-            return res.status(404).json({ success: false, message: "No OTP found for this phone number." });
+            return res.status(404).json({ success: false, message: "No reset request found. Please start again." });
         }
-
+ 
         const record = otpResult.rows[0];
-        const attempts = record.attempts || 0;
-
+ 
+        // The placeholder code must never be usable: the phone has to be proven via Telegram first
+        if (record.tg_status !== 'code_sent') {
+            return res.status(400).json({ success: false, message: "Please verify with Telegram first." });
+        }
+ 
         if (record.seconds_remaining <= 0) {
             await zingoPool.query('DELETE FROM booking_otp WHERE "phone_number" = $1', [formattedPhoneNumber]);
-            return res.status(400).json({ success: false, message: "OTP has expired. Please request a new one." });
+            return res.status(400).json({ success: false, message: "Code has expired. Please request a new one." });
         }
-
-        const newAttempts = attempts + 1;
+ 
+        const newAttempts = (record.attempts || 0) + 1;
         await zingoPool.query(
             `UPDATE booking_otp SET attempts = $1 WHERE "phone_number" = $2`,
             [newAttempts, formattedPhoneNumber]
         );
-
+ 
         if (newAttempts > 3) {
             await zingoPool.query('DELETE FROM booking_otp WHERE "phone_number" = $1', [formattedPhoneNumber]);
-            return res.status(401).json({ success: false, message: "Too many attempts. Please request a new OTP." });
+            return res.status(401).json({ success: false, message: "Too many attempts. Please start again." });
         }
-
-        if (otpCode !== record.otp_code) {
+ 
+        if (String(otpCode) !== record.otp_code) {
             return res.status(400).json({
                 success: false,
-                message: `Invalid OTP. You have ${3 - newAttempts} attempts remaining.`
+                message: `Invalid code. You have ${3 - newAttempts} attempts remaining.`
             });
         }
-
-        // Verified — burn the OTP, then reset the password right away.
-        // newPassword only ever existed in this one request; it's never
-        // written to booking_otp at all.
-        await zingoPool.query('DELETE FROM booking_otp WHERE "phone_number" = $1', [formattedPhoneNumber]);
-
+ 
+        // Reset FIRST, then burn the OTP: if Firebase fails, the user can retry with the same code
         await resetFirebasePassword(formattedPhoneNumber, newPassword);
-
+        await zingoPool.query('DELETE FROM booking_otp WHERE "phone_number" = $1', [formattedPhoneNumber]);
+ 
         return res.status(200).json({ success: true, message: "Password reset successfully." });
     } catch (error) {
-        console.error("Error executing query or resetting password:", error);
+        console.error("Error resetting password:", error);
         return res.status(500).json({ success: false, message: "Internal server error." });
     }
 });
-
 router.post("/user/registration/otp/resend/:phoneNumber", async (req, res) => {
     console.log("==========OTP Resend==========");
 

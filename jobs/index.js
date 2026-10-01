@@ -5,7 +5,7 @@ let running = false;
 
 function startJobs() {
   // Every minute. The `running` flag stops runs from overlapping.
- cron.schedule("*/30 * * * * *", async () => {
+ cron.schedule("*/60 * * * * *", async () => {
   console.log("[jobs] tick", new Date().toISOString());
   if (running) return;
   running = true;
