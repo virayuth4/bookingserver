@@ -12,6 +12,7 @@ const randomHex = crypto.randomBytes(8).toString("hex");
 const { getPageForMerchant } = require("../../../lib/getPageForMerchant");
 const { UUID_RE } = require("../../../lib/uuidRe");
 const { escapeHtml, formatBookingDate, formatBookingTime } = require("../../../lib/formats");
+const { buildBookingKeyboard } = require("../../../lib/bookingKeyboard");
 const DEBUG = process.env.TELEGRAM_DEBUG === "1" || process.env.NODE_ENV !== "production";
 const dbg = (...args) => { if (DEBUG) console.log("[tg-debug]", ...args); };
 
@@ -171,29 +172,21 @@ function buildBookerText(booking) {
   const notesLine = booking.note ? `\n📝 Notes: ${escapeHtml(booking.note)}` : "";
   const detailsBlock = `${dateLine}${timeLine}${partyLine}${notesLine}`;
 
-  // merchant_telegram_chat_id is a raw numeric chat id, not a shareable
-  // t.me/ link — it only lets *your bot* message that chat server-side.
-  // Swap in a real @username or phone number from booking_pages if you
-  // have one, for something the booker can actually tap/use.
-  const merchantContact = escapeHtml(
-    [booking.merchant_telegram, booking.merchant_phone].filter(Boolean).join(" or ") || "the business"
-  );
-  const trackingLine = `\n\n<a href="${process.env.NEXT_PUBLIC_FRONTEND}/my-bookings/${booking.id}">View your booking here</a>`;
+  const merchantPhone = escapeHtml(booking.merchant_phone || "the business");
 
   switch (booking.status) {
-    case "confirmed":
-      return `✅ <b>Your booking at ${businessName} is confirmed!</b>${detailsBlock}\n\nIf you need to make any changes, please contact the merchant directly at: ${merchantContact}.${trackingLine}`;
-    case "declined":
-      return `❌ <b>Your booking at ${businessName} was declined.</b>${detailsBlock}\n\nPlease try a different time, or contact the merchant directly if you have questions.${trackingLine}`;
-    case "cancelled":
-      return `🗑 <b>Your booking at ${businessName} was cancelled by the business.</b>${detailsBlock}\n\nPlease contact the merchant directly at: ${merchantContact} if you have questions.${trackingLine}`;
-    case "completed":
-      return `🎉 <b>Thanks for visiting ${businessName}!</b>${detailsBlock}${trackingLine}`;
-    default:
-      return null; // no_show: stay silent
+  case "confirmed":
+    return `✅ <b>Your booking at ${businessName} is confirmed!</b>\n\n${detailsBlock}\n\nIf you need to make any changes, please contact the merchant directly below or call them at: ${merchantPhone}.`;
+  case "declined":
+    return `❌ <b>Your booking at ${businessName} was declined.</b>\n\n${detailsBlock}\n\nPlease try a different time, or contact the merchant directly below or call them at: ${merchantPhone} if you have questions.`;
+  case "cancelled":
+    return `🗑 <b>Your booking at ${businessName} was cancelled by the business.</b>\n\n${detailsBlock}\n\nPlease contact the merchant directly below or call them at: ${merchantPhone} if you have questions.`;
+  case "completed":
+    return `🎉 <b>Thanks for visiting ${businessName}!</b>\n\n${detailsBlock}`;
+  default:
+    return null; // no_show: stay silent
   }
 }
-
 // Shared by Telegram + dashboard so the transition rules live in one place.
 // Returns the updated booking row, or null if the transition isn't allowed
 // (already handled, wrong current status, or too early for no-show).
@@ -375,12 +368,20 @@ async function handleBookingStatusCallback(callbackQuery) {
     );
 
     // Notify the booker (customer) on their own chat, if they've connected Telegram
-    if (booking.telegram_chat_id) {
-      const bookerText = buildBookerText(booking);
-      if (bookerText) {
-        await sendTelegramMessage(booking.telegram_chat_id, bookerText, null, CUSTOMER_TELEGRAM_API);
-      }
-    }
+if (booking.telegram_chat_id) {
+  const bookerText = buildBookerText(booking);
+  if (bookerText) {
+    const keyboard = buildBookingKeyboard(booking, {
+      noMessage: booking.status === "completed",
+    });
+    await sendTelegramMessage(
+      booking.telegram_chat_id,
+      bookerText,
+      keyboard,
+      CUSTOMER_TELEGRAM_API
+    );
+  }
+}
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("handleBookingStatusCallback error:", err);

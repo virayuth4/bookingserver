@@ -1,6 +1,7 @@
 const axios = require("axios");
 const zingoPool = require("../database/pgZingo");
 const { escapeHtml, formatBookingDate, formatBookingTime } = require("../lib/formats");
+const { buildBookingKeyboard } = require("../lib/bookingKeyboard");
 
 const CUSTOMER_BOT_TOKEN = process.env.ACME_RESERVE_CUSTOMER_BOT_TOKEN;
 const CUSTOMER_TELEGRAM_API = `https://api.telegram.org/bot${CUSTOMER_BOT_TOKEN}`;
@@ -42,21 +43,7 @@ function merchantChatUrl(booking) {
   return null;
 }
 
-function buildReminderKeyboard(booking) {
-  console.log("booking", booking)
-  const rows = [];
-  const chatUrl = booking.merchant_telegram;
-  console.log("chatUrl", chatUrl)
 
-  if (chatUrl) {
-    rows.push([{ text: `💬 Message ${booking.business_name || "the business"}`, url: chatUrl }]);
-  }
-  rows.push([
-    { text: "📋 View booking", url: `acmereserve.com/my-bookings/${booking.id}` },
-  ]);
-
-  return { inline_keyboard: rows };
-}
 
 function buildReminderText(booking, key) {
   const businessName = escapeHtml(booking.business_name || "the business");
@@ -147,7 +134,7 @@ async function sendRemindersFor({ key, column, leadMinutes, minLeadMinutes, requ
     await sendMessage(
       booking.telegram_chat_id,
       buildReminderText(booking, key),
-      buildReminderKeyboard(booking)
+      buildBookingKeyboard(booking)
     );
   }
   if (rows.length) console.log(`[reminders] ${key}: sent ${rows.length}`);
