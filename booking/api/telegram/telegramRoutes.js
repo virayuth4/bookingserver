@@ -178,9 +178,9 @@ function buildBookerText(booking) {
   case "confirmed":
     return `✅ <b>Your booking at ${businessName} is confirmed!</b>\n\n${detailsBlock}\n\nIf you need to make any changes, please contact the merchant directly below or call them at: ${merchantPhone}.`;
   case "declined":
-    return `❌ <b>Your booking at ${businessName} was declined.</b>\n\n${detailsBlock}\n\nPlease try a different time, or contact the merchant directly below or call them at: ${merchantPhone} if you have questions.`;
+    return `❌ <b>Your booking at ${businessName} was declined.</b>\n\n${detailsBlock}\n\nPlease try a different time, or contact the merchant directly below or call them at: ${merchantPhone} if you have any questions.`;
   case "cancelled":
-    return `🗑 <b>Your booking at ${businessName} was cancelled by the business.</b>\n\n${detailsBlock}\n\nPlease contact the merchant directly below or call them at: ${merchantPhone} if you have questions.`;
+    return `🗑 <b>Your booking at ${businessName} was cancelled by the business.</b>\n\n${detailsBlock}\n\nPlease contact the merchant directly below or call them at: ${merchantPhone} if you have any questions.`;
   case "completed":
     return `🎉 <b>Thanks for visiting ${businessName}!</b>\n\n${detailsBlock}`;
   default:
@@ -271,11 +271,12 @@ async function editTelegramReplyMarkup(chatId, messageId, replyMarkup) {
 }
 
 // Helper to answer callback queries (removes button loading spinner)
-async function answerCallbackQuery(callbackQueryId, text = "") {
+async function answerCallbackQuery(callbackQueryId, text = "", showAlert = false) {
   try {
     return await axios.post(`${TELEGRAM_API}/answerCallbackQuery`, {
       callback_query_id: callbackQueryId,
       text,
+      show_alert: showAlert,
     });
   } catch (err) {
     console.error("Telegram answerCallbackQuery error:", err.response?.data || err.message);
@@ -785,16 +786,17 @@ router.post("/telegram-webhook", async (req, res) => {
           return;
         }
 
-        await answerCallbackQuery(callbackId, `Sure you want to ${cfg.label}?`);
-        await editTelegramReplyMarkup(chatId, messageId, {
+        await Promise.all([
+        answerCallbackQuery(callbackId, `🚨 Sure you want to ${cfg.label}?`),
+        editTelegramReplyMarkup(chatId, messageId, {
           inline_keyboard: [
             [
               { text: `Yes, ${cfg.label}`, callback_data: `yes_${action}:${bookingId}` },
-              // "back_pending" or "back_confirmed" → restores the right keyboard
               { text: "↩️ Back", callback_data: `back_${cfg.from[0]}:${bookingId}` },
             ],
           ],
-        });
+        }),
+      ]);
         return;
       }
     }
