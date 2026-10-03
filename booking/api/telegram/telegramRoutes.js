@@ -575,7 +575,7 @@ router.post("/telegram-webhook", async (req, res) => {
   res.sendStatus(200);
 
   const { message, callback_query } = req.body || {};
-  const dashboardUrl = "https://acmereserve.com";
+  const dashboardUrl = "https://acmereserve.com/admin/booking/create";
   const botUsername = process.env.MERHCHANT_TELEGRAM_BOT_USERNAME;
 
   // =========================================================================
