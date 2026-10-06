@@ -106,22 +106,15 @@ function formatServiceName(booking) {
 }
 
 function resolveServiceLabel(page, booking) {
-  const sections = Array.isArray(page?.sections) ? page.sections : [];
   const serviceTypes = Array.isArray(page?.service_types) ? page.service_types : [];
-
-  const sectionMatch = sections.find((s) =>
-    typeof s === "string" ? s === booking.section_id : s.id === booking.section_id
-  );
-  const sectionName = typeof sectionMatch === "string" ? sectionMatch : sectionMatch?.name ?? "";
 
   const serviceMatch = serviceTypes.find((s) =>
     typeof s === "string"
       ? s.toLowerCase().replace(/\s+/g, "-") === booking.service_type_id || s === booking.service_type_id
       : s.id === booking.service_type_id
   );
-  const serviceName = typeof serviceMatch === "string" ? serviceMatch : serviceMatch?.name ?? "";
 
-  return [sectionName, serviceName].filter(Boolean).join(" · ");
+  return typeof serviceMatch === "string" ? serviceMatch : serviceMatch?.name ?? "";
 }
 
 function resolveSectionLabel(page, booking) {
@@ -156,23 +149,33 @@ function buildMerchantBookingText(booking, header, { requestedAt } = {}) {
 }
 // Builds the full edited message text (already HTML-escaped, since
 // callbackQuery.message.text is plain text and we send with parse_mode HTML).
-function buildUpdatedMessage(originalText, status, responderName, booking) {
+function buildUpdatedMessage(originalText, status, responderName) {
   const meta = STATUS_META[status];
 
-  // Keep the header language (Khmer vs English) of the original message
-  const firstLine = (originalText || "").split("\n")[0] || "";
-  const header = /[\u1780-\u17FF]/.test(firstLine) ? meta.km : meta.en;
+  // Drop any previous status footer so they don't pile up
+  const base = stripFooter(originalText || "");
+  const [firstLine, ...rest] = base.split("\n");
 
-  const body = buildMerchantBookingText(booking, header);
+  // Keep the header language (Khmer vs English) of the original
+  const isKhmer = /[\u1780-\u17FF]/.test(firstLine);
+  const header = isKhmer ? meta.km : meta.en;
+
+  const body = escapeHtml(rest.join("\n"));
   const statusLine = `👤 ${escapeHtml(meta.verb)} by ${escapeHtml(responderName || "someone")}`;
 
-  return `${body}${FOOTER_SEP}\n${statusLine}`;
+  return `<b>${escapeHtml(header)}</b>\n${body}${FOOTER_SEP}\n${statusLine}`;
 }
 
 // Message sent to the customer's own chat. Returns null when we stay silent.
 function buildBookerText(booking) {
   const businessName = escapeHtml(booking.business_name || "the business");
 
+  // Resolve the branch name from the page's sections
+  const sectionLabel =
+    booking.section_label ||
+    resolveSectionLabel({ sections: booking.page_sections }, booking);
+
+  const branchLine = sectionLabel ? `\n📍 Branch: ${escapeHtml(sectionLabel)}` : "";
   const dateLine = booking.booking_date
     ? `\n📅 Date: ${escapeHtml(formatBookingDate(booking.booking_date))}`
     : "";
@@ -181,7 +184,7 @@ function buildBookerText(booking) {
     : "";
   const partyLine = booking.guests ? `\n👥 Party size: ${escapeHtml(String(booking.guests))}` : "";
   const notesLine = booking.note ? `\n📝 Notes: ${escapeHtml(booking.note)}` : "";
-  const detailsBlock = `${dateLine}${timeLine}${partyLine}${notesLine}`;
+  const detailsBlock = `${branchLine}${dateLine}${timeLine}${partyLine}${notesLine}`;
 
   const merchantPhone = escapeHtml(booking.merchant_phone || "the business");
 
@@ -221,7 +224,12 @@ async function applyBookingStatus(client, { bookingId, action, actorId, actorNam
        AND b.status = ANY($5)
        AND bp.id = b.booking_page_id
        ${startedClause}
-     RETURNING b.*, bp.name AS business_name, bp.telegram AS merchant_telegram, bp.phone AS merchant_phone;`,
+     RETURNING b.*,
+      bp.name AS business_name,
+      bp.telegram AS merchant_telegram,
+      bp.phone AS merchant_phone,
+      bp.sections AS page_sections,
+      bp.service_types AS page_service_types;`,
     [cfg.to, actorId, actorName, bookingId, cfg.from]
   );
 

@@ -505,12 +505,29 @@ function parseServiceTypes(raw) {
   const parsed = parseJsonField(raw, []);
   if (!Array.isArray(parsed)) return { value: [] };
 
-  const cleaned = parsed
-    .filter((s) => typeof s === "string" && s.trim().length > 0)
-    .map((s) => s.trim().slice(0, 50)); // limit character length
+  const seen = new Set();
+  const value = [];
 
-  // Prevent spamming too many services
-  return { value: Array.from(new Set(cleaned)).slice(0, 20) };
+  for (const item of parsed) {
+    // Old format: "Nails". New format: { id, name, note }
+    const obj = typeof item === "string" ? { name: item } : item;
+    if (!obj || typeof obj !== "object") continue;
+
+    const name = String(obj.name ?? "").trim().slice(0, 50);
+    if (!name) continue;
+
+    const id = String(obj.id || name.toLowerCase()).trim().slice(0, 60);
+    if (seen.has(id)) continue;
+    seen.add(id);
+
+    value.push({
+      id,
+      name,
+      note: String(obj.note ?? "").trim().slice(0, 500),
+    });
+  }
+
+  return { value: value.slice(0, 20) };
 }
 
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -1254,25 +1271,27 @@ router.post('/booking/create', async (req, res) => {
 
     // Booking is safely stored. Now send the customer their receipt (best effort).
    if (customerChatId && telegramWriteAccess) {
-  const keyboard = buildBookingKeyboard({
-    id: booking.id,
-    business_name: page.name,
-    merchant_telegram: page.telegram,
-    merchant_chat_id: page.telegram_chat_id,
-  });
+const keyboard = buildBookingKeyboard({
+  id: booking.id,
+  business_name: page.name,
+  merchant_telegram: page.telegram,
+  merchant_chat_id: page.telegram_chat_id,
+  section_id: booking.section_id,   // was page.section_id
+});
 
-  notified = await sendCustomerReceipt(
-    customerChatId,
-    `📩 Booking request received\n` +
-      `⏳ Status: Pending confirmation\n` +
-      `――――――――――――――――\n\n` +
-      `${page.name ? `🏬 ${page.name}\n` : ''}` +
-      `👥 Guests: ${booking.guests}\n` +
-      `📅 Date: ${formatBookingDate(booking.booking_date)}\n` +
-      `⏰ Time: ${formatBookingTime(booking.start_time)}\n\n` +
-      `The venue hasn't confirmed yet. We'll message you here as soon as they accept or decline.`,
-    keyboard
-  );
+ notified = await sendCustomerReceipt(
+  customerChatId,
+  `📩 Booking request received\n` +
+    `⏳ Status: Pending confirmation\n` +
+    `――――――――――――――――\n\n` +
+    `${page.name ? `🏬 ${page.name}\n` : ''}` +
+    `${booking.section_label ? `📍 Branch: ${booking.section_label}\n` : ''}` +
+    `👥 Guests: ${booking.guests}\n` +
+    `📅 Date: ${formatBookingDate(booking.booking_date)}\n` +
+    `⏰ Time: ${formatBookingTime(booking.start_time)}\n\n` +
+    `The venue hasn't confirmed yet. We'll message you here as soon as they accept or decline.`,
+  keyboard
+);
   await zingoPool.query(
     `UPDATE bookings SET telegram_notify_ok = $1 WHERE id = $2`,
     [notified, booking.id]
