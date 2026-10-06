@@ -134,8 +134,11 @@ async function logMerchantTokenAtStartup() {
 // ---------------------------------------------------------------------------
 
 const BOOKING_TABLE = 'booking_pages';
-const MAX_IMAGES_PER_ROW = 5;
-const MAX_TOTAL_IMAGES = 40; // sanity cap across all rows combined; adjust as you like
+const MAX_IMAGES_PER_ROW = 5;      // now counts photos + videos together
+const MAX_TOTAL_IMAGES = 40;       // photos + videos across all rows
+const MAX_TOTAL_VIDEOS = 5;        // keep this low, videos are big
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;  // 10MB
+const MAX_VIDEO_BYTES = 50 * 1024 * 1024;  // 50MB
 const MAX_CLOSED_DATES = 366;
 const DAY_KEYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -144,19 +147,47 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const PLAN_LIMITS = { basic: 1, pro: 10 };
 const DEFAULT_PLAN = 'basic';
 
+const ALLOWED_VIDEO_MIME = ['video/mp4', 'video/webm', 'video/quicktime'];
+const VIDEO_URL_RE = /\.(mp4|m4v|mov|webm)(\?.*)?$/i;
+
+const isVideoFile = (file) => file.mimetype?.startsWith('video/');
+const isImageFile = (file) => file.mimetype?.startsWith('image/');
+const isVideoUrl = (url) => typeof url === 'string' && VIDEO_URL_RE.test(url);
+
 const bookingUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB per file
-    files: MAX_TOTAL_IMAGES,    // hard cap on total files per request, across all rows
+    // multer has ONE size limit for all files, so use the larger (video) limit
+    // here and enforce the smaller image limit manually in buildImageRows().
+    fileSize: MAX_VIDEO_BYTES,
+    files: MAX_TOTAL_IMAGES,
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) return cb(null, true);
+    if (ALLOWED_VIDEO_MIME.includes(file.mimetype)) return cb(null, true);
+    cb(new Error('Only photos (PNG, JPG, WEBP) and videos (MP4, WEBM, MOV) are allowed.'));
   },
 });
 
-// Field names are dynamic ("images_row_0", "images_row_1", ...) since rows are
-// user-defined, so we can't use .fields() with a fixed list. .any() accepts
-// any field name; groupNewFilesByRow() below filters req.files down to only
-// fieldnames matching /^images_row_(\d+)$/ and silently drops anything else.
-const handleBookingMulter = bookingUpload.any();
+// Wrapped so multer errors (file too large, bad type) return clean JSON
+// instead of falling through to Express's default HTML error page.
+const handleBookingMulter = (req, res, next) => {
+  bookingUpload.any()(req, res, (err) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({
+          error: `Files are too large. Photos can be up to ${MAX_IMAGE_BYTES / 1024 / 1024}MB and videos up to ${MAX_VIDEO_BYTES / 1024 / 1024}MB.`,
+        });
+      }
+      if (err.code === 'LIMIT_FILE_COUNT') {
+        return res.status(400).json({ error: `You can upload up to ${MAX_TOTAL_IMAGES} files at once.` });
+      }
+      return res.status(400).json({ error: err.message });
+    }
+    return res.status(400).json({ error: err.message || 'Invalid upload.' });
+  });
+};
 
 function parseJsonField(raw, fallback) {
   if (raw === undefined || raw === null || raw === '') return fallback;
@@ -312,7 +343,29 @@ function groupNewFilesByRow(files) {
   }
   return byRow;
 }
+async function uploadFilesPreservingOrder(files, slug) {
+  const imageIdx = [];
+  const videoIdx = [];
+  files.forEach((f, i) => (isVideoFile(f) ? videoIdx : imageIdx).push(i));
 
+  const [imageUrls, videoUrls] = await Promise.all([
+    imageIdx.length
+      ? uploadMediaFilesToS3(imageIdx.map((i) => files[i]), slug, 'image', {
+          pathPrefix: 'eatdoko/booking-pages/gallery',
+        })
+      : [],
+    videoIdx.length
+      ? uploadMediaFilesToS3(videoIdx.map((i) => files[i]), slug, 'video', {
+          pathPrefix: 'eatdoko/booking-pages/gallery',
+        })
+      : [],
+  ]);
+
+  const ordered = new Array(files.length);
+  imageIdx.forEach((origIdx, k) => { ordered[origIdx] = imageUrls[k]; });
+  videoIdx.forEach((origIdx, k) => { ordered[origIdx] = videoUrls[k]; });
+  return ordered;
+}
 /**
  * Builds the final image_rows array (label + all image paths per row),
  * uploading any new files to S3 along the way.
@@ -320,35 +373,52 @@ function groupNewFilesByRow(files) {
  * newFilesByRow: Map<number, Express.Multer.File[]>
  */
 async function buildImageRows(rowsMeta, newFilesByRow, slug) {
-  const imageRows = [];
+  const badRequest = (msg) => Object.assign(new Error(msg), { status: 400 });
+
+  // ---- Validate everything BEFORE uploading anything to S3 ----
   let totalCount = 0;
+  let totalVideos = 0;
 
   for (let idx = 0; idx < rowsMeta.length; idx++) {
     const { label, existing_image_paths: existing } = rowsMeta[idx];
     const newFiles = newFilesByRow.get(idx) || [];
 
     if (existing.length + newFiles.length > MAX_IMAGES_PER_ROW) {
-      throw Object.assign(new Error(`"${label}" can have up to ${MAX_IMAGES_PER_ROW} photos.`), {
-        status: 400,
-      });
+      throw badRequest(`"${label}" can have up to ${MAX_IMAGES_PER_ROW} photos/videos.`);
     }
 
-    let uploaded = [];
-    if (newFiles.length) {
-      uploaded = await uploadMediaFilesToS3(newFiles, slug, 'image', {
-        pathPrefix: 'eatdoko/booking-pages/gallery',
-      });
+    for (const file of newFiles) {
+      if (!isImageFile(file) && !isVideoFile(file)) {
+        throw badRequest(`"${file.originalname}" is not a supported photo or video.`);
+      }
+      if (isImageFile(file) && file.size > MAX_IMAGE_BYTES) {
+        throw badRequest(`Photo "${file.originalname}" is larger than ${MAX_IMAGE_BYTES / 1024 / 1024}MB.`);
+      }
+      if (isVideoFile(file) && file.size > MAX_VIDEO_BYTES) {
+        throw badRequest(`Video "${file.originalname}" is larger than ${MAX_VIDEO_BYTES / 1024 / 1024}MB.`);
+      }
     }
 
-    const paths = [...existing, ...uploaded];
-    totalCount += paths.length;
-    imageRows.push({ label, image_paths: paths });
+    totalCount += existing.length + newFiles.length;
+    totalVideos +=
+      existing.filter(isVideoUrl).length + newFiles.filter(isVideoFile).length;
   }
 
   if (totalCount > MAX_TOTAL_IMAGES) {
-    throw Object.assign(new Error(`You can upload up to ${MAX_TOTAL_IMAGES} photos in total.`), {
-      status: 400,
-    });
+    throw badRequest(`You can upload up to ${MAX_TOTAL_IMAGES} photos/videos in total.`);
+  }
+  if (totalVideos > MAX_TOTAL_VIDEOS) {
+    throw badRequest(`You can add up to ${MAX_TOTAL_VIDEOS} videos in total.`);
+  }
+
+  // ---- Upload ----
+  const imageRows = [];
+  for (let idx = 0; idx < rowsMeta.length; idx++) {
+    const { label, existing_image_paths: existing } = rowsMeta[idx];
+    const newFiles = newFilesByRow.get(idx) || [];
+
+    const uploaded = newFiles.length ? await uploadFilesPreservingOrder(newFiles, slug) : [];
+    imageRows.push({ label, image_paths: [...existing, ...uploaded] });
   }
 
   return imageRows;
