@@ -12,7 +12,7 @@ const { getPageForMerchant } = require("../../../lib/getPageForMerchant");
 const { UUID_RE } = require("../../../lib/uuidRe");
 const { formatRequestedAt, formatBookingDate, formatBookingTime } = require("../../../lib/formats");
 const { getVerifiedTelegramUser, verifyInitData, sendCustomerReceipt } = require("../../../lib/verifyInitData");
-const { buildMerchantBookingText, PENDING_KEYBOARD, resolveServiceLabel } = require("../telegram/telegramRoutes");
+const { buildMerchantBookingText, PENDING_KEYBOARD, resolveServiceLabel, resolveSectionLabel } = require("../telegram/telegramRoutes");
 const { buildBookingKeyboard } = require("../../../lib/bookingKeyboard");
 const { parseTelegramInput } = require("../../../lib/parsers");
 
@@ -1210,6 +1210,7 @@ router.post('/booking/create', async (req, res) => {
 
     // Set after the event insert so it isn't stored in the payload
     booking.service_label = resolveServiceLabel(page, booking);
+    booking.section_label = resolveSectionLabel(page, booking);
 
     const text = buildMerchantBookingText(booking, "🔔 New booking request", {
       requestedAt: formatRequestedAt(),

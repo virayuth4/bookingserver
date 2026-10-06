@@ -124,6 +124,16 @@ function resolveServiceLabel(page, booking) {
   return [sectionName, serviceName].filter(Boolean).join(" · ");
 }
 
+function resolveSectionLabel(page, booking) {
+  if (!booking.section_id) return null;
+  const sections = Array.isArray(page.sections) ? page.sections : [];
+  const match = sections.find((s) =>
+    typeof s === 'string' ? s === booking.section_id : s?.id === booking.section_id
+  );
+  if (!match) return null; // don't show a raw id to the merchant
+  return typeof match === 'string' ? match : match.name ?? null;
+}
+
 function buildMerchantBookingText(booking, header, { requestedAt } = {}) {
   // Prefer the resolved label; fall back to prettifying service_type_id
   const service = booking.service_label || formatServiceName(booking);
@@ -133,6 +143,7 @@ function buildMerchantBookingText(booking, header, { requestedAt } = {}) {
     requestedAt ? `🕒 Requested on: ${escapeHtml(requestedAt)}` : null,
     "",
     booking.full_name ? `🙋 Name: ${escapeHtml(booking.full_name)}` : null,
+    booking.section_label ? `📍 Branch: ${escapeHtml(booking.section_label)}\n` : '',
     booking.booking_date ? `📅 Date: ${escapeHtml(formatBookingDate(booking.booking_date))}` : null,
     booking.start_time ? `⏰ Time: ${escapeHtml(formatBookingTime(booking.start_time))}` : null,
     service ? `🍽 Service: ${escapeHtml(service)}` : null,
@@ -967,3 +978,4 @@ module.exports = router;
 module.exports.resolveServiceLabel = resolveServiceLabel;
 module.exports.buildMerchantBookingText = buildMerchantBookingText;
 module.exports.PENDING_KEYBOARD = PENDING_KEYBOARD;
+module.exports.resolveSectionLabel = resolveSectionLabel;
