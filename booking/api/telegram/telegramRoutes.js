@@ -614,7 +614,32 @@ router.post("/telegram-webhook", async (req, res) => {
       const username = message.from?.username ? `@${message.from.username}` : senderName;
       const rawToken = startMatch[1]?.trim();
 
-      if (!rawToken) return;
+          if (!rawToken) {
+      // Plain /start: merchant opened the bot directly
+      const fullName = [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ");
+
+      // 1. Reply to the merchant (this also opens the chat so you can message them later)
+      await sendTelegramMessage(
+        chatId,
+        `👋 Hi <b>${escapeHtml(senderName)}</b>!\n\nYou're connected. We'll send your booking notifications here.`
+      );
+
+      // 2. Send the details to YOU so you can paste the chat ID into the database
+      const adminChatId = process.env.ADMIN_TELEGRAM_CHAT_ID;
+      if (adminChatId) {
+        await sendTelegramMessage(
+          adminChatId,
+          `🆕 <b>New /start</b>\n\n` +
+            `Name: ${escapeHtml(fullName || "-")}\n` +
+            `Username: ${message.from?.username ? "@" + escapeHtml(message.from.username) : "-"}\n` +
+            `Chat ID: <code>${chatId}</code>\n` +
+            `Type: ${chatType}`
+        );
+      }
+
+      console.log("[tg] /start from", chatId, fullName, username);
+      return;
+    }
 
       const isGroupChat = chatType === "group" || chatType === "supergroup";
 
