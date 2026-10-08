@@ -12,7 +12,12 @@ const {startJobs} = require('./jobs/index.js')
 require('dotenv').config();
 
 
+const path = require('path');
+const env = process.env.NODE_ENV || 'development';
 
+require('dotenv').config({ path: path.resolve(__dirname, `.env.${env}`) });
+// optional: let .env.local override
+require('dotenv').config({ path: path.resolve(__dirname, '.env.local'), override: true });
 
 
 process.on("unhandledRejection", (err) => {
@@ -91,6 +96,9 @@ app.use('/api/booking-link', require('./booking/api/booking/slugRoutes.js'))
 app.use('/api/booking-link', require('./booking/api/telegram/telegramRoutes.js'))
 app.use('/api/booking-link', require('./booking/api/telegram/telegramOTP.js'))
 
+
+//For admin
+app.use('/api/admin', require('./api/admin/invalidateCacheRoutes.js'))
 
 // For view tracking
 app.use('/api/booking-link', require('./api/tracker/trackViewRoutes.js'))
