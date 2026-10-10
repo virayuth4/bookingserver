@@ -1270,7 +1270,7 @@ router.post('/booking/create', async (req, res) => {
   booking.service_label = resolveServiceLabel(page, booking);
   booking.section_label = resolveSectionLabel(page, booking);
 
-  // 2a. Notify the venue
+  // 2a. Venue MUST be notified, otherwise the booking doesn't count
   try {
     const text = buildMerchantBookingText(booking, '🔔 New booking request', {
       requestedAt: formatRequestedAt(),
@@ -1278,14 +1278,22 @@ router.post('/booking/create', async (req, res) => {
     const tgData = await tgSend(page.telegram_chat_id, text, PENDING_KEYBOARD(booking.id));
     const messageId = tgData.result?.message_id ? String(tgData.result.message_id) : null;
 
+    // This UPDATE is what makes the booking "count"
     await zingoPool.query(
       `UPDATE bookings SET telegram_message_id = $1, merchant_notified = true WHERE id = $2`,
       [messageId, booking.id]
     );
     booking.telegram_message_id = messageId;
+    booking.merchant_notified = true;
   } catch (err) {
-    // Booking is saved. Leave merchant_notified = false so it can be retried later.
     console.error(`Merchant notify failed for booking ${booking.id}:`, err.message);
+    await zingoPool
+      .query(
+        `INSERT INTO booking_events (booking_id, type, payload, actor) VALUES ($1,'notify_failed',$2,'system')`,
+        [booking.id, JSON.stringify({ error: err.message })]
+      )
+      .catch(() => {});
+    return res.status(502).json({ error: "Couldn't reach the venue right now. Please try again." });
   }
 
   // 2b. Customer receipt (best effort)

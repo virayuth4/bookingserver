@@ -18,7 +18,7 @@ function startJobs() {
   }
 });
 
-  // console.log("[jobs] scheduled: booking reminders");
+  console.log("[jobs] scheduled: booking reminders");
 }
 
 module.exports = { startJobs };
