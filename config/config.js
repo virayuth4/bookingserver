@@ -40,7 +40,8 @@ const defaultOrigins = [
         'https://www.acmereserve.com/tg',
         'https://afterglow-monsieur-quarterly.ngrok-free.dev',
         'https://afterglow-monsieur-quarterly.ngrok-free.app',
-        'https://afterglow-monsieur-quarterly.ngrok-free.dev/tg'
+        'https://afterglow-monsieur-quarterly.ngrok-free.dev/tg',
+        'https://zeloev.eatdoko.com'
     ];
 
     const corsOrigins = process.env.CORS_ORIGINS

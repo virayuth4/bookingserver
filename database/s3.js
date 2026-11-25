@@ -1,11 +1,43 @@
 // aws-s3.js - Memory Storage Version
-const { S3Client, GetObjectCommand, ListObjectsV2Command, DeleteObjectCommand, CopyObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, GetObjectCommand, ListObjectsV2Command, DeleteObjectCommand, CopyObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
+const crypto = require("crypto");
 const { Upload } = require("@aws-sdk/lib-storage");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const multer = require('multer');
 const sharp = require('sharp');
 const path = require('path');
 require('dotenv').config();
+const EXT_BY_MIME = {
+  "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif",
+  "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov",
+};
+
+const UPLOAD_CACHE_CONTROL = "public, max-age=31536000, immutable";
+
+// Returns a short-lived URL the browser can PUT a file to directly.
+const createPresignedUpload = async ({ prefix, contentType }) => {
+  const ext = EXT_BY_MIME[contentType];
+  if (!ext) throw new Error(`Unsupported content type: ${contentType}`);
+
+  const key = `${prefix.replace(/\/$/, "")}/${crypto.randomUUID()}.${ext}`;
+  const uploadUrl = await getSignedUrl(
+    s3Client,
+    new PutObjectCommand({
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: key,
+      ContentType: contentType,
+      CacheControl: UPLOAD_CACHE_CONTROL,
+    }),
+    { expiresIn: 600 }
+  );
+
+  return {
+    uploadUrl,
+    publicUrl: getCdnUrl(key), // CloudFront URL, same format your old uploads returned
+    contentType,
+    cacheControl: UPLOAD_CACHE_CONTROL,
+  };
+};
 
 // Create S3 client
 const s3Client = new S3Client({
@@ -15,6 +47,18 @@ const s3Client = new S3Client({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
 });
+
+const MAX_IMAGE_DIMENSION = 3000; // longest side, px
+
+const prepareImage = (buffer) =>
+  sharp(buffer)
+    .rotate()
+    .resize({
+      width: MAX_IMAGE_DIMENSION,
+      height: MAX_IMAGE_DIMENSION,
+      fit: 'inside',
+      withoutEnlargement: true,
+    });
 
 // Helper to construct CloudFront CDN URL (with S3 fallback)
 const getCdnUrl = (key) => {
@@ -38,10 +82,7 @@ const upload = multer({
 // Image conversion functions
 const convertToWebP = async (buffer, quality = 100) => {
   try {
-    const webpBuffer = await sharp(buffer)
-      .webp({ quality: quality })
-      .toBuffer();
-    return webpBuffer;
+    return await prepareImage(buffer).webp({ quality }).toBuffer();
   } catch (error) {
     console.error("Error converting to WebP:", error);
     throw error;
@@ -50,16 +91,12 @@ const convertToWebP = async (buffer, quality = 100) => {
 
 const convertToAVIF = async (buffer, quality = 70) => {
   try {
-    const avifBuffer = await sharp(buffer)
-      .avif({ quality: quality })
-      .toBuffer();
-    return avifBuffer;
+    return await prepareImage(buffer).avif({ quality }).toBuffer();
   } catch (error) {
     console.error("Error converting to AVIF:", error);
     throw error;
   }
 };
-
 // Move file in S3
 const moveFileInS3 = async (sourceKey, destinationKey) => {
   const copyParams = {
@@ -419,4 +456,7 @@ module.exports = {
   convertToAVIF,
   uploadFilesSequentially,
   uploadSingleFileToS3,
+  createPresignedUpload,
+  getCdnUrl,
+  EXT_BY_MIME
 };

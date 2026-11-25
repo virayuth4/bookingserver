@@ -95,6 +95,21 @@ app.use('/api/booking-link', require('./booking/api/booking/bookingRoutes.js'))
 app.use('/api/booking-link', require('./booking/api/booking/slugRoutes.js'))
 app.use('/api/booking-link', require('./booking/api/telegram/telegramRoutes.js'))
 app.use('/api/booking-link', require('./booking/api/telegram/telegramOTP.js'))
+app.use('/api/booking-link', require('./booking/api/merchants/merchantRoutes.js'))
+
+
+// For ev Car
+app.use('/api/evcar', require('./evcar/api/user/userRoutes.js'))
+app.use('/api/evcar', require('./evcar/api/telegram/telegramOTP.js'))
+app.use('/api/evcar', require('./evcar/api/telegram/telegramWebhook.js'))
+app.use('/api/evcar', require('./evcar/api/posting/postingRoutes.js'))
+app.use('/api/evcar', require('./evcar/api/posting/listingRoutes.js'))
+app.use('/api/evcar', require('./evcar/api/bumps/bumpRoutes.js'))
+app.use('/api/evcar', require('./evcar/api/events/trackRoutes.js'))
+
+
+app.use('/api/evcar', require('./evcar/api/posting/dealershipRoutes.js'))
+
 
 
 //For admin
