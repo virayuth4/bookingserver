@@ -33,7 +33,7 @@ const OIDC_MAX_AGE = 10 * 60 * 1000;
 const CLIENT_ID = process.env.EV_TELEGRAM_CLIENT_ID;
 const CLIENT_SECRET = process.env.EV_TELEGRAM_CLIENT_SECRET;
 const REDIRECT_URI = process.env.EV_TELEGRAM_REDIRECT_URI;
-const FRONTEND_URL = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND;
+const FRONTEND_URL ="https://zeloev.com";
 
 
 // Startup check: shows which variables are missing (never prints values)
