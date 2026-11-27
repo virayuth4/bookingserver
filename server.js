@@ -61,9 +61,7 @@ app.get('/robots.txt', (req, res) => {
   res.send('User-agent: *\nDisallow:'); // or your preferred robots.txt content
 });
 
-app.get('/sitemap.xml', (req, res) => {
-  res.status(404).send('Not Found'); // or serve actual sitemap
-});
+
 
 app.get('/favicon.ico', (req, res) => {
   res.status(404).send('Not Found'); // or serve actual favicon
@@ -106,6 +104,7 @@ app.use('/api/evcar', require('./evcar/api/posting/postingRoutes.js'))
 app.use('/api/evcar', require('./evcar/api/posting/listingRoutes.js'))
 app.use('/api/evcar', require('./evcar/api/bumps/bumpRoutes.js'))
 app.use('/api/evcar', require('./evcar/api/events/trackRoutes.js'))
+app.use('/api/evcar', require('./sitemap.js'))
 
 
 app.use('/api/evcar', require('./evcar/api/posting/dealershipRoutes.js'))

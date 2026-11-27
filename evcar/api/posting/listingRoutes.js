@@ -1,9 +1,6 @@
 const express = require("express");
-const crypto = require("crypto");
 const router = express.Router();
-const multer = require("multer");
 const { uploadMediaFilesToS3, deleteFileFromS3 } = require("../../../database/s3");
-const { parseTelegramInput } = require("../../../lib/parsers");
 const zingoPool = require("../../../database/pgZingo");
 const { requireAuth } = require("../telegram/session");
 
@@ -32,6 +29,104 @@ function requireAdmin(req, res, next) {
   }
   next();
 }
+
+const slugSql = (col) =>
+  `trim(both '-' from lower(regexp_replace(${col}, '[^a-zA-Z0-9]+', '-', 'g')))`;
+
+// GET /models: every make/model pair (for the sitemap and a models index)
+router.get('/models', async (req, res) => {
+  try {
+    const { rows } = await zingoPool.query(
+      `SELECT
+         ${slugSql('make')}  AS make_slug,
+         ${slugSql('model')} AS model_slug,
+         mode() WITHIN GROUP (ORDER BY make)  AS make,
+         mode() WITHIN GROUP (ORDER BY model) AS model,
+         count(*)::int AS total,
+         count(*) FILTER (WHERE status = 'available')::int AS available,
+         max(bumped_at) AS updated_at
+       FROM ev_listings
+       WHERE deleted_at IS NULL
+         AND make IS NOT NULL AND make <> ''
+         AND model IS NOT NULL AND model <> ''
+       GROUP BY 1, 2
+       ORDER BY available DESC, total DESC`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('GET /models failed', err);
+    res.status(500).json({ error: 'Could not load models' });
+  }
+});
+
+// GET /models/:make/:model: price range, stats and listings for one model
+router.get('/models/:make/:model', async (req, res) => {
+  const params = [req.params.make, req.params.model];
+  const match = `deleted_at IS NULL AND ${slugSql('make')} = $1 AND ${slugSql('model')} = $2`;
+
+  try {
+    const [stats, listings] = await Promise.all([
+      zingoPool.query(
+        `SELECT
+           mode() WITHIN GROUP (ORDER BY make)  AS make,
+           mode() WITHIN GROUP (ORDER BY model) AS model,
+           count(*)::int AS total,
+           count(*) FILTER (WHERE status = 'available')::int AS available,
+           min(COALESCE(price_min, price)::float8)
+             FILTER (WHERE status = 'available' AND currency = 'USD'
+                     AND COALESCE(price_min, price) > 0) AS min_price,
+           max(COALESCE(price_max, price)::float8)
+             FILTER (WHERE status = 'available' AND currency = 'USD'
+                     AND COALESCE(price_max, price) > 0) AS max_price,
+           min(year) FILTER (WHERE status = 'available') AS min_year,
+           max(year) FILTER (WHERE status = 'available') AS max_year,
+           max(range_km) FILTER (WHERE status = 'available') AS max_range_km
+         FROM ev_listings
+         WHERE ${match}`,
+        params
+      ),
+      zingoPool.query(
+        `SELECT
+           id, slug, title, status, condition, currency, year,
+           price::float8 AS price,
+           masked_price,
+           mileage_km, range_km,
+           car->>'location' AS location,
+           COALESCE(image_rows->0->'image_paths'->>0,
+                    image_rows->1->'image_paths'->>0) AS cover_image
+         FROM ev_listings
+         WHERE ${match}
+         ORDER BY (status = 'available') DESC, bumped_at DESC NULLS LAST
+         LIMIT 24`,
+        params
+      ),
+    ]);
+
+    const s = stats.rows[0];
+    if (!s || s.total === 0) return res.status(404).json({ error: 'Model not found' });
+    res.json({ ...s, currency: 'USD', listings: listings.rows });
+  } catch (err) {
+    console.error('GET /models/:make/:model failed', err);
+    res.status(500).json({ error: 'Could not load model' });
+  }
+});
+
+// GET /listing-slugs: for the sitemap
+router.get('/listing-slugs', async (req, res) => {
+  try {
+    const { rows } = await zingoPool.query(
+      `SELECT slug, COALESCE(bumped_at, created_at) AS updated_at
+         FROM ev_listings
+        WHERE deleted_at IS NULL
+        ORDER BY id DESC
+        LIMIT 50000`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('GET /listing-slugs failed', err);
+    res.status(500).json({ error: 'Could not load slugs' });
+  }
+});
 
 // GET /dealers: list for the dropdown
 router.get('/dealers', requireAuth, requireAdmin, async (req, res) => {
